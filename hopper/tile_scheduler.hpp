@@ -315,6 +315,9 @@ public:
         }
         __syncthreads();
         int tile_idx = __ppu_read_firstlane(*tile_count_smem) + int(gridDim.x);
+        // All warps must consume the broadcast before the next tile can reuse
+        // its shared storage, including the empty-tile fast path.
+        __syncthreads();
         return {tile_idx, current_work.tile_idx, current_work.block_idx, current_work.split_idx, current_work.bidh, current_work.bidb};
     }
 
