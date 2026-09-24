@@ -103,6 +103,17 @@ struct CollectiveMainloopFwdSm80 {
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
 
+#if defined(USE_PPU) && USE_AIU && defined(FLASHATTENTION_PPU_MIMO_PREFILL)
+    // Only the guarded MiMo tile staggers QK/PV matrix loads between warps.
+    static constexpr bool StaggerMma = ArchTag::kMinComputeCapability == 89 &&
+        std::is_same_v<Element, cutlass::bfloat16_t> && kHeadDim == 192 && kHeadDimV == 128 &&
+        kBlockM == 128 && kBlockN == 64 && kNWarps == 8 && kStages == 3 && Q_in_regs &&
+        Is_causal && !Is_local && !Has_softcap && Varlen && PagedKV && PagedKVAiu &&
+        kBlockNPagedPerAiuLoad == 64 && PackGQA && !Split && !AppendKV && !Is_QSA;
+#else
+    static constexpr bool StaggerMma = false;
+#endif
+
 #ifdef USE_PPU
     // Each warp executes QK. Give every warp the same valid score
     // tile, while PV continues to distribute its output columns across warps.
@@ -1072,7 +1083,7 @@ struct CollectiveMainloopFwdSm80 {
                     tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, load_V_next
                 );
             } else {
-                flash::gemm_sm80<Q_in_regs>(
+                flash::gemm_sm80<Q_in_regs, false, false, StaggerMma>(
                     tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0),
                     tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, load_V_next
                 );
@@ -1238,7 +1249,7 @@ struct CollectiveMainloopFwdSm80 {
                     tOrO, tOrP, tOrV, shared_storage.tensors.mainloop.smem_v.data(),
                     kStages > 1 ? smem_pipe_read : 0, tiled_mma);
             } else {
-                flash::gemm_rs_sm80(tOrO, tOrP, tOrV, tOsVt(_, _, _, kStages > 1 ? smem_pipe_read : 0), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+                flash::gemm_rs_sm80<StaggerMma>(tOrO, tOrP, tOrV, tOsVt(_, _, _, kStages > 1 ? smem_pipe_read : 0), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
             }
 #else
             flash::gemm_rs_sm80(tOrO, tOrP, tOrV, tOsVt(_, _, _, kStages > 1 ? smem_pipe_read : 0), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
