@@ -20,6 +20,7 @@
 #include "tile_size.h"
 #include "tile_scheduler.hpp"
 #ifdef USE_PPU
+#include "mimo_prefill.h"
 #include "qsa/tile_scheduler.hpp"
 #endif
 #ifndef FLASHATTENTION_DISABLE_SM90
@@ -43,6 +44,7 @@ template <int Arch, int kHeadDim, int kHeadDimV, int ClusterM, typename Element,
 #ifdef USE_PPU
           bool PackGQA, bool Split, bool V_colmajor, bool kBlockM128, bool kBlockM16, bool kBlockN16, bool Is_QSA=false
           , class QsaConfig = flash::QsaConfig
+          , bool MimoPrefill = false
           >
 #else
           bool PackGQA, bool Split, bool V_colmajor>
@@ -51,6 +53,11 @@ void run_flash_fwd(Flash_fwd_params &params, hggcStream_t stream) {
 #ifdef USE_PPU
     static_assert(!QsaConfig::M || (Is_QSA && kHeadDim == 256 && kHeadDimV == 256 && PackGQA),
                   "QSA configurations require packed hdim256 QSA");
+    static_assert(!MimoPrefill || (Arch == 89 && kHeadDim == 192 && kHeadDimV == 128 &&
+                  std::is_same_v<Element, cutlass::bfloat16_t> && Is_causal && !Is_local &&
+                  !Has_softcap && Varlen && PagedKVNonTMA && !AppendKV &&
+                  PackGQA && !Split && !V_colmajor && !Is_QSA && !QsaConfig::M),
+                  "MiMo prefill requires the guarded BF16 paged full-attention path");
 #endif
     static_assert(!(Is_causal && Is_local), "Causal and Local cannot be enabled at the same time");
     static_assert(!(AppendKV && V_colmajor), "AppendKV and V_colmajor cannot be enabled at the same time");
@@ -67,7 +74,9 @@ void run_flash_fwd(Flash_fwd_params &params, hggcStream_t stream) {
 #ifdef USE_PPU
     // Using PackGQA=true routine (using cp.aync) has impact on tiling (concerning vreg amount).
     static constexpr auto kBlockMN_kNWarps_Stages_RS = [] {
-        if constexpr (QsaConfig::M) {
+        if constexpr (MimoPrefill) {
+            return flash::mimo_prefill_tile;
+        } else if constexpr (QsaConfig::M) {
             return std::tuple<int, int, int, int, bool>{QsaConfig::M, QsaConfig::N,
                 QsaConfig::Warps, QsaConfig::Stages, QsaConfig::QRegs};
         } else {
@@ -339,6 +348,21 @@ void run_mha_fwd_(Flash_fwd_params &params, hggcStream_t stream) {
     static_assert(sizeof(T) == 2 || sizeof(T) == 1, "Only 16bit and 8bit are supported");
     static constexpr bool Is_FP8 = cute::is_same_v<T, cutlass::float_e4m3_t> || cute::is_same_v<T, cutlass::float_e5m2_t>;
     using T_out = std::conditional_t<!Is_FP8, T, cutlass::bfloat16_t>;
+#if defined(USE_PPU) && USE_AIU && defined(FLASHATTENTION_PPU_MIMO_PREFILL)
+    if constexpr (Arch == 89 && kHeadDim == 192 && kHeadDimV == 128 &&
+                  std::is_same_v<T, cutlass::bfloat16_t> && PagedKVNonTMA &&
+                  PackGQA && !Split && !Has_softcap && !Is_QSA) {
+        if (flash::use_mimo_prefill(params)) {
+            run_flash_fwd<Arch, kHeadDim, kHeadDimV, 1, T, T_out,
+                true /*causal*/, false /*local*/, false /*softcap*/, true /*varlen*/,
+                true /*paged KV*/, true /*AIU*/, 64, false /*append*/, false /*Qv*/,
+                true /*PackGQA*/, false /*split*/, false /*V colmajor*/,
+                true /*block M128*/, false /*block M16*/, false /*block N16*/,
+                false /*QSA*/, flash::QsaConfig, true /*MiMo prefill*/>(params, stream);
+            return;
+        }
+    }
+#endif
 #if defined(USE_PPU)
     if constexpr (Is_QSA && PagedKVNonTMA) {
         // QSA always has unpadded queries, per-token pages, and no KV append.

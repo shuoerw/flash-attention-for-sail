@@ -54,6 +54,8 @@ DISABLE_SM90 = os.getenv("FLASH_ATTENTION_DISABLE_SM90", ("TRUE" if USE_PPU else
 DISABLE_SM80 = os.getenv("FLASH_ATTENTION_DISABLE_SM80", "FALSE") == "TRUE"
 DISABLE_SM89 = os.getenv("FLASH_ATTENTION_DISABLE_SM89", "FALSE") == "TRUE"
 ENABLE_VCOLMAJOR = os.getenv("FLASH_ATTENTION_ENABLE_VCOLMAJOR", "FALSE") == "TRUE"
+# FALSE retains the current baseline tiling and reduction order for A/B checks.
+ENABLE_PPU_MIMO_PREFILL = USE_PPU and os.getenv("FLASH_ATTENTION_PPU_MIMO_PREFILL", "TRUE") == "TRUE"
 
 
 # ============================================================================
@@ -133,6 +135,7 @@ if not SKIP_CUDA_BUILD:
         + ["-DFLASHATTENTION_DISABLE_SM86"]
         + (["-DFLASHATTENTION_DISABLE_SM90"] if DISABLE_SM90 else [])
         + (["-DFLASHATTENTION_ENABLE_VCOLMAJOR"] if ENABLE_VCOLMAJOR else [])
+        + (["-DFLASHATTENTION_PPU_MIMO_PREFILL"] if ENABLE_PPU_MIMO_PREFILL else [])
         + ["-DUSE_PPU", "-DUSE_AIU=1"]
         + (["-DFA3_HLLM_BUILD"] if FA3_HLLM_BUILD else [])
         + (["-DFA3_HLLM_USE_ADDR"] if FA3_HLLM_USE_ADDR else [])
