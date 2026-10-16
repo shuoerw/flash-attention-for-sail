@@ -58,7 +58,7 @@ extern "C" int fa_k3_run(void** ptr, int const* cfg, cudaStream_t stream) {
         bool const interleaved = flash::sm89_prefill_schedule(p) != flash::Sm89PrefillSchedule::Default;
         return status ? -status : (interleaved ? 1000 : 0) + (p.use_kblockm_16 ? 16 : m128 ? 128 : 64);
     }
-    if (mode == 0 && p.use_kblockm_16) {
+    if ((mode == 0 || mode == 1) && p.use_kblockm_16) {
         if (p.is_causal) launch<true, false, flash::Sm89PrefillSchedule::Default, true>(p, stream);
         else launch<false, false, flash::Sm89PrefillSchedule::Default, true>(p, stream);
         int status = int(cudaGetLastError());

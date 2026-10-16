@@ -13,7 +13,7 @@
 
 namespace flash {
 
-// Layout eligibility and minimum work for the SM89 prefill schedules.
+// Layout eligibility and minimum work for the SM89 paged prefill schedules.
 // Query tiling and KV splits are selected by the ordinary forward dispatcher.
 inline Sm89PrefillSchedule sm89_prefill_schedule(Flash_fwd_params const& p) {
     if (p.arch != 89 || !p.is_bf16 || p.is_local || p.is_qsa
@@ -48,15 +48,7 @@ inline Sm89PrefillSchedule sm89_prefill_schedule(Flash_fwd_params const& p) {
             ? Sm89PrefillSchedule::WarpInterleaved
             : Sm89PrefillSchedule::WarpInterleavedPrefetch;
     }
-    if (p.pack_gqa || p.num_splits != 1 || p.h != 12 || p.h_k != p.h
-        || int64_t(p.total_k) < int64_t(p.b) * Sm89PrefillConfig::MinDenseKvTokens
-        || !p.cu_seqlens_k || p.seqused_k || p.s_aux_ptr
-        || p.k_head_stride != 192 || p.k_row_stride != p.h * 192
-        || (p.v_head_stride != 128 && p.v_head_stride != 256)
-        || p.v_row_stride != p.h * p.v_head_stride) {
-        return Sm89PrefillSchedule::Default;
-    }
-    return Sm89PrefillSchedule::WarpInterleaved;
+    return Sm89PrefillSchedule::Default;
 }
 
 }  // namespace flash

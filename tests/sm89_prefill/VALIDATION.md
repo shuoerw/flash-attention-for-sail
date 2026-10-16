@@ -48,11 +48,13 @@ Coverage includes:
 - Small-query, decode, local-attention, empty-request, partial-page, and sink
   numerical checks; Q464–469 and KV960/1023/1024/1025 timing boundaries.
 
-The exact final source passes 61 MiMo and 51 Kimi host selector checks. All 171
-MiMo and 32 Kimi device-kernel bodies match the preceding combined commit byte
-for byte. Five unaffected dtype/dimension/layout templates compile against the
-final headers. All 41 source hashes in each build manifest match the checkout.
-Python syntax and diff whitespace checks pass.
+The MiMo validation snapshot passes 61 host selector checks. Its 171
+device-kernel bodies match the preceding validated MiMo implementation byte
+for byte. Five unaffected dtype/dimension/layout templates compile against
+that snapshot, and all 41 source hashes match its build manifest. Python
+syntax and diff whitespace checks pass. Kimi's separate WI-only evaluation
+and current dispatch decision are recorded in
+[its validation report](../sm89_k3_prefill/VALIDATION.md).
 
 ## Performance
 
@@ -67,6 +69,8 @@ the original-schedule A/A control.
 The table uses the faster median of the two original-schedule controls and the
 higher-sample repeat where available. Positive reduction means lower latency.
 These are single-card attention-operator measurements, not serving throughput.
+The MiMo reductions include both warp interleaving and optional LLC prefetch;
+they are not an isolated measurement of interleaving alone.
 
 | Queries | Live KV | Reduction |
 | --- | --- | ---: |

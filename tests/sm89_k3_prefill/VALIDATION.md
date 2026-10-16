@@ -1,97 +1,115 @@
-# Kimi K3 SM89 prefill validation
+# Kimi K3 SM89 warp-interleaving evaluation
 
-Validated on 2026-10-16 on node78, container `shuoer_mimo`, GPU0 ZW-M890P
-(SM89, 39 CUs), under the shared GPU lock. Branch:
-`feature/sm89-fwd-warp-interleave`.
+Validated on 2026-10-16 in node78's `shuoer_mimo` container, on ZW-M890P
+(SM89, 39 CUs). The final performance sweep used GPU7 under
+`/tmp/shuoer-node78-ppu7.lock`; device process checks showed no competing GPU7
+job. An earlier GPU4 sweep was interrupted after another user's job appeared
+on that device. Its overlapping timings are excluded from the conclusions.
 
-The normal forward dispatcher selects the shared one-stage named-barrier
-mainloop for BF16 D192/V128 expanded MHA, with 12 local Q/KV heads on TP8.
-The query tile retains the existing M64/M128 selection; the KV tile is N96.
-See [README.md](README.md) for the layout and numerical contracts.
+## Scope and decision
 
-## Selector and coverage
+Both sides use the original N64 tile policy, the original M64/four-warp or
+M128/eight-warp selection, and one shared K tile plus one shared V tile.
+The interleaved candidate changes warp scheduling only. Dense prefill has no
+LLC-prefetch extension. B counts requests per TP8 replica; every TP rank
+processes its own 12-head shard.
 
-The selector has no batch-size, query-length, or context-length upper cutoffs.
-It retains the supported layout checks and the minimum average live KV length
-of 4,096 tokens. The redundant maximum-KV check and checks of data pointers
-already supplied by the forward API were removed. Unsupported features and
-short-query M16 work retain the ordinary dispatch.
+The candidate does not meet the approximately 1% regression allowance.
+The production dense dispatcher therefore retains the original kernel.
+The N96 override and average-KV eligibility gate have been removed.
+An explicit N64 candidate remains available as test mode 1; mode 8 exercises
+the unchanged production dense dispatcher. Earlier combined N96/interleaving
+gains are not evidence for this WI-only candidate.
 
-The context suite contains 30 cases:
+## Correctness and build checks
 
-- Causal and noncausal 4K-query chunks at every power-of-two KV context from
-  4K through 1M.
-- Full prefill from 8K through 64K and 64K-query chunks through 1M KV.
-- Mixed query lengths `[4096, 8192, 32768, 20480]`, totaling 64K, with live KV
-  `[4096, 8192, 98304, 151552]`. The first two requests have no cached prefix;
-  the last two have 64K and 128K prefixes.
-- The same mixed queries with live KV `[4096, 8192, 524288, 1048576]`.
-- Q=65,537 / KV=1,048,577 and B=257 / Q=256 / KV=4,096, crossing the removed
-  limits. B counts requests per TP8 replica, not independent batches per card.
+The 30-case context sweep checks complete output and LSE bit for bit against
+the original N64 schedule. Small workloads use full FP32 references; larger
+workloads check sampled query rows and every head against the full live KV.
+All 30 cases pass, including output, LSE, and scheduler guard regions.
 
-## Validation
+Coverage includes causal and noncausal 4K chunks from 4K through 1M KV,
+full prompts and 64K query chunks, the mixed queries
+`[4096,8192,32768,20480]` with live KV
+`[4096,8192,98304,151552]`, the longer-prefix variant ending at 1M KV,
+and the removed upper-limit boundary cases.
 
-The final source passes 51 host selector checks. All 32 device-kernel bodies
-match both the context-matrix build and the preceding combined commit byte for
-byte. The final rebuild passes 27 boundary cases, eight smoke cases, and three
-51-sample context repeats with bit-exact output/LSE agreement against the
-context-matrix library. A 401-sample short-fallback repeat also passes: 69 case
-executions including the 30-case context sweep.
+The final build passes four dense dispatch checks and two compile-time
+original-tiling assertions, plus all 61 paged MiMo selector checks. Five
+unaffected dtype/dimension/layout templates compile. All 32 device-kernel
+bodies match the N64 trial build exactly; its 27 original-schedule bodies
+also match the preceding validated baseline. The final adapter preserves
+M16 fallback in both baseline and candidate mode.
 
-Every case compares complete output and LSE against the original N64 kernel.
-Small inputs use full FP32 references; larger inputs check five query rows per
-request and every head against all live K/V. Guard regions around output, LSE,
-and scheduler buffers remain intact. N96 changes reduction grouping, so
-comparison against N64 uses the tolerances documented in README; fallback and
-same-geometry library comparisons are exact.
+The final rebuilt adapter also passes eight smoke, 21 safety, and 27
+mixed-length boundary cases, checking both the explicit candidate and the
+restored production dispatcher. All 56 pass exact output/LSE, FP32 reference,
+and guard-region checks.
 
-## Performance
+The test requires exact native output/LSE comparisons; there is no
+different-tile reduction-tolerance option. The explicit WI candidate is
+checked directly against FP32 even when the production dispatcher takes
+the original kernel.
 
-Timing randomizes library order, evicts 256 MiB between samples, and includes an
-identical original-schedule A/A control. The context sweep uses 11 samples per
-variant; boundary and selected context repeats use 51. These are single-card
-attention-operator measurements, not model-serving throughput.
+## WI-only performance
 
-All 30 context cases were faster than the original schedule. Representative
-latency reductions against the faster original A/A control (using the
-higher-sample repeat where available):
+The signal comparison uses 101 samples per variant; the 30-case context
+sweep uses 11. Both randomize variant order, evict 256 MiB between samples,
+and include an identical A/A baseline. The table uses the faster baseline
+median and the 101-sample signal result where available. Positive values
+mean slower. Measurements cover the attention operator, not model serving.
 
-| Queries | Live KV | Attention | Reduction |
+| New queries | Live KV | Attention | Latency change |
 | --- | --- | --- | ---: |
-| 4K | 4K | causal | 2.62% |
-| 4K | 32K | causal | 11.86% |
-| 4K | 1M | causal | 20.80% |
-| 64K | 64K | causal | 14.53% |
-| 64K | 1M | causal | 23.25% |
-| 4K | 1M | noncausal prefix | 22.22% |
-| mixed 64K | 4K / 8K / 96K / 148K | causal | 16.66% |
-| mixed 64K | 4K / 8K / 512K / 1M | causal | 21.19% |
-| 65,537 | 1,048,577 | causal | 20.91% |
-| 257 requests × 256 | 4K each | causal | 6.59% |
+| 4K | 4K | causal | -1.03% |
+| 16K | 16K | causal | -0.49% |
+| 64K | 64K | causal | -0.05% |
+| 2K | 128K | noncausal | +2.04% |
+| 4K | 128K | causal | +2.80% |
+| 4K | 1M | causal | +3.25% |
+| 64K | 1M | causal | +3.26% |
+| mixed 64K | 4K / 8K / 96K / 148K | causal | +1.97% |
+| mixed 64K | 4K / 8K / 512K / 1M | causal | +2.23% |
 
-The 27 boundary checks had a worst measured slowdown of 0.61%. No requested
-4K–1M context case regressed. An initial 17-query/17-KV fallback sample was
-+2.12%; its 401-sample repeat measured +0.07%, with the identical A/A control
-at +0.59%. The fallback device instructions are unchanged. These are measured
-case medians, not a universal bound on individual invocation latency.
+Short-case regressions also occur. These results do not justify enabling
+the candidate generally or claiming that WI provides the previous
+combined tiling/scheduling speedups.
 
-## Scope and evidence
+## Scheduling diagnosis
 
-The suite exercises the normal C++ dispatcher with one KV split. It does not
-validate absorbed MLA, KDA, other TP head counts, a full Python-package build,
-or serving throughput. The largest normal query chunk is 64K; Q=KV=1M in one
-call was not tested. No memory/race sanitizer was available.
+A same-N64 profile of Q2K/KV128K noncausal attention shows identical tensor
+instruction counts, 240 registers per thread, and 48 KiB shared memory
+for baseline and candidate. WI increases issued instructions by 3.27%.
+The profiler's compute-dependency stall ratio decreases from 0.197 to
+0.084, while its instruction-fetch stall ratio increases from 0.062 to
+0.119. These are ratios per active issue, not utilization percentages.
+Tensor active cycles over elapsed cycles decrease from 41.21% to 40.33%.
 
-Remote workspace: `/o-work/shuoer/dev/fa-prefill-general-20261016`.
-Final library: `final-k3/libfa.so`. SHA256:
+This supports partial dependency hiding offset by additional execution and
+scheduling overhead. It does not establish hardware saturation or prove
+that no better WI schedule exists.
 
-```
-07607b20cadfdd48b77f2ab44f14db6c55ad65bc267843d67d9844ad2b696a7b
-```
+Three isolated, same-tiling scheduling probes passed their tested exact
+numerical comparisons but failed to fix the performance problem:
 
-Evidence is retained in
-`/Users/shor/dev/T-HEAD/flash-attention-k3-wi-backup-20261015-evidence/prefill-general-20261016/node78`.
-The context matrix is `results/dense-contexts.json`; final checks are
-`results/final-k3-{boundaries,smoke,context-repeat}.json`. Build manifests record
-all 41 source hashes. Device-code comparisons are retained alongside the timing
-samples. Use README to reproduce the suites.
+- Earlier next-K refill improved some short cases, but Q2K/KV128K remained
+  about 2% slower than the original.
+- Allowing initial QK fragments before the previous-V-reader wait made that
+  case 5.41% slower.
+- Alternating leading/trailing warp membership reduced that regression to
+  1.13%, but made Q512/KV8K 8.50% slower.
+
+None of these probes is included in production source.
+
+## Evidence and limits
+
+Raw results, compiler manifests, source snapshots, and profiles are retained
+under `/o-work/shuoer/dev/fa-kimi-wi-only-20261016`. Primary files are
+`results/gpu7-probes-signal.json`, `results/gpu7-n64-contexts.json`,
+`results/final-machine-code.json`, and `profiles/m{0,8}-raw.csv`.
+The trial adapter's mode 8 selected WI; final test mode 1 instantiates the
+same device body. Final production mode 8 retains the original schedule.
+
+These are standalone adapter tests, not a full Python-package installation
+or a serving deployment. They establish failure of this candidate's
+performance acceptance test, not a universal limit of warp interleaving.

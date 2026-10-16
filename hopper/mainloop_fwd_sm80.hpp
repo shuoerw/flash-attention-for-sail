@@ -117,7 +117,7 @@ struct CollectiveMainloopFwdSm80 {
         && Varlen && !Is_local && !AppendKV && !Has_softcap && !Is_QSA
         && (DensePrefillInterleave
             ? (!PagedKV && !PackGQA && !Split && !PrefillPrefetch
-                && kBlockN == Sm89PrefillConfig::DenseTileN
+                && kBlockN == 64
                 && ((kBlockM == 64 && kNWarps == 4) || (kBlockM == 128 && kNWarps == 8)))
             : (kBlockM == 64 && kBlockN == 64 && kNWarps == 4 && PagedKV && PagedKVAiu
                 && kBlockNPagedPerAiuLoad == 64 && PackGQA && Is_causal))),

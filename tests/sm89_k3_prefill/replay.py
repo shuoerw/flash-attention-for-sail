@@ -15,11 +15,10 @@ p.add_argument('--suite', choices=['smoke', 'signal', 'safety', 'boundaries', 'c
 p.add_argument('--extra-mode', type=int, default=8)
 p.add_argument('--exact-extra', action='store_true', help='Require extra libraries to match the normal dispatcher bit-for-bit.')
 p.add_argument('--samples', type=int, default=31)
-p.add_argument('--modes', type=int, nargs='+', choices=[0, 1, 8], default=[0, 8])
+p.add_argument('--modes', type=int, nargs='+', choices=[0, 1, 8], default=[0, 1, 8])
 p.add_argument('--case', help='B,Q,K,H,causal; overrides suite')
 p.add_argument('--case-index', type=int, action='append', help='Repeat selected zero-based cases from a suite.')
 p.add_argument('--installed', action='store_true')
-p.add_argument('--allow-reduction-difference', action='store_true', help='Use numerical tolerance when comparing different KV tile widths.')
 a=p.parse_args()
 torch.set_grad_enabled(False)
 torch.backends.cuda.matmul.allow_tf32=False
@@ -53,7 +52,7 @@ elif a.suite=='boundaries':
     cases=[case(1,512,k,12,c) for k in [4095,4096,4097] for c in [True,False]]
     cases += [case(4,512,k,12,c) for k in [4095,4096,4097] for c in [True,False]]
     cases += [case(4,513,k,12,c,True) for k in [6553,6554,8193] for c in [True,False]]
-    # Many short requests with one long outlier, on either side of the average-KV gate.
+    # Many short requests with one long outlier.
     cases += [dict(qs=[64]*31+[512],ks=[128]*31+[k],h=12,causal=c,strided=True)
               for k in [65536,131072] for c in [True,False]]
     cases += [dict(qs=[0,512,0,129],ks=[0,8192,0,8192],h=12,causal=c,strided=True)
@@ -115,7 +114,7 @@ def run_case(spec):
     checks={}
     for label,call in calls.items():
         actual,actual_lse=call(); torch.cuda.synchronize()
-        if label!='installed' and not a.allow_reduction_difference:
+        if label!='installed':
             assert torch.equal(actual,baseline),f'{label}: output differs from default: max_abs={(actual.float()-baseline.float()).abs().max().item()}, count={(actual!=baseline).sum().item()}'
             assert torch.equal(actual_lse,baseline_lse),f'{label}: LSE differs from default'
         else:
@@ -127,7 +126,7 @@ def run_case(spec):
             assert torch.equal(actual,dispatch_output) and torch.equal(actual_lse,dispatch_lse), 'Refactor differs from validated library'
         checks[label]='passed'
     candidate = candidate_lse = None
-    for label in ['m8', 'm1']:
+    for label in ['m1', 'm8']:
         if label in calls:
             x,xl=calls[label](); candidate=x.clone(); candidate_lse=xl.clone()
             torch.cuda.synchronize()

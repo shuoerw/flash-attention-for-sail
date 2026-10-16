@@ -75,8 +75,7 @@ void run_flash_fwd(Flash_fwd_params &params, hggcStream_t stream) {
         } else {
             return tile_size_fwd_ppu(Arch, kHeadDim, kHeadDimV, Is_causal, Is_local, sizeof(Element),
                 PagedKVNonTMA, Varlen, Split, Has_softcap, AppendKV, PackGQA,
-                kBlockM128, kBlockM16, kBlockN16, PagedKVAiu, Is_QSA,
-                PrefillSchedule != flash::Sm89PrefillSchedule::Default);
+                kBlockM128, kBlockM16, kBlockN16, PagedKVAiu, Is_QSA);
         }
     }();
 #else
@@ -416,20 +415,6 @@ void run_mha_fwd_(Flash_fwd_params &params, hggcStream_t stream) {
                                         }
                                     });
                                 } else {
-#if !defined(FA3_HLLM_BUILD)
-                                    if constexpr (Arch == 89 && cute::is_same_v<T, cutlass::bfloat16_t>
-                                        && kHeadDim == 192 && kHeadDimV == 128 && !Is_local && !Has_softcap
-                                        && Varlen && !AppendKV && !HasQv && !PackGQA && !Split
-                                        && !V_colmajor && !kBlockM16 && !kBlockN16) {
-                                        if (flash::sm89_prefill_schedule(params) == flash::Sm89PrefillSchedule::WarpInterleaved) {
-                                            run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out,
-                                                Is_causal, Is_local, Has_softcap, Varlen, false, false, 1,
-                                                false, false, false, false, V_colmajor, kBlockM128, false,
-                                                false, false, flash::QsaConfig, flash::Sm89PrefillSchedule::WarpInterleaved>(params, stream);
-                                            return;
-                                        }
-                                    }
-#endif
                                     run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, false /*PagedKVNonTMA*/, false /*PagedKVAiu*/,  1 /*kBlockNPagedPerAiuLoad_*/, !Is_QSA && AppendKV && Varlen, HasQv, PackGQA, Split, V_colmajor, kBlockM128, kBlockM16, false /*kBlockN16*/, Is_QSA>(params, stream);
                                 }
 #else

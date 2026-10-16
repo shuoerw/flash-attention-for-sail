@@ -22,9 +22,6 @@ struct Sm89PrefillConfig {
     static constexpr int MinPrefetchTiles = 512;
     static constexpr int MinQueryTilesPerSm = 3;
     static constexpr int MinKvTokens = 1024;
-    // Nonpaged MHA amortizes the wider tile at longer contexts.
-    static constexpr int DenseTileN = 96;
-    static constexpr int MinDenseKvTokens = 4096;
 };
 
 }  // namespace flash
@@ -107,7 +104,7 @@ constexpr std::tuple<int, int, int, int, bool> tile_size_fwd_ppu(
         bool paged_kv=false, bool varlen=false, bool split=false,
         bool softcap=false, bool append_kv=false, bool pack_gqa = false,
         bool kBlockM128=false, bool kBlockM16=false, bool kBlockN16=false,
-        bool PagedKVAiu=false, bool is_qsa=false, bool warp_interleave=false) {
+        bool PagedKVAiu=false, bool is_qsa=false) {
     if (element_size == 2) {
         bool const vreg_strain = paged_kv || pack_gqa || varlen || is_local;
         if (kBlockM16) {
@@ -147,12 +144,6 @@ constexpr std::tuple<int, int, int, int, bool> tile_size_fwd_ppu(
                 return {128, 64, 4, 1, false};
             }
         } else if (headdim <= 192) {
-            if (warp_interleave && arch == 89 && headdim == 192 && headdim_v == 128
-                && !paged_kv && !pack_gqa && varlen && !split && !is_local
-                && !softcap && !append_kv && !is_qsa) {
-                return {kBlockM128 ? 128 : 64, flash::Sm89PrefillConfig::DenseTileN,
-                        kBlockM128 ? 8 : 4, 1, true};
-            }
             if (!kBlockM128 || arch != 89) {
                 return {64, 64, 4, 1, true};
             } else {
