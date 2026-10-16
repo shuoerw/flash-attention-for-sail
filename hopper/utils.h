@@ -412,13 +412,13 @@ template<bool A_in_regs=false, bool B_in_regs=false, bool SwapAB=false,
          typename Tensor0, typename Tensor1,
          typename Tensor2, typename Tensor3, typename Tensor4,
          typename TiledMma, typename TiledCopyA, typename TiledCopyB,
-         typename ThrCopyA, typename ThrCopyB, typename Hook>
+         typename ThrCopyA, typename ThrCopyB, typename Hook, typename FragmentHook = std::nullptr_t>
 CUTLASS_DEVICE void gemm_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsA,
                               Tensor4 const& tCsB, TiledMma tiled_mma,
                               TiledCopyA smem_tiled_copy_A, TiledCopyB smem_tiled_copy_B,
-                              ThrCopyA smem_thr_copy_A, ThrCopyB smem_thr_copy_B, Hook fn) {
+                              ThrCopyA smem_thr_copy_A, ThrCopyB smem_thr_copy_B, Hook fn, FragmentHook after_fragment = nullptr) {
     if constexpr (SwapAB) {
-        gemm_sm80<B_in_regs, A_in_regs>(acc, tCrB, tCrA, tCsB, tCsA, tiled_mma, smem_tiled_copy_B, smem_tiled_copy_A, smem_thr_copy_B, smem_thr_copy_A, fn);
+        gemm_sm80<B_in_regs, A_in_regs>(acc, tCrB, tCrA, tCsB, tCsA, tiled_mma, smem_tiled_copy_B, smem_tiled_copy_A, smem_thr_copy_B, smem_thr_copy_A, fn, after_fragment);
     } else {
         CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));                     // MMA_M
         CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));                     // MMA_N
@@ -438,6 +438,8 @@ CUTLASS_DEVICE void gemm_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor
                 if (i == 0) { fn(); }
             }
             cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+            // Release dependent warp groups after this reduction fragment.
+            if constexpr (!std::is_same_v<FragmentHook, std::nullptr_t>) { after_fragment(i); }
         }
         }
 #else
@@ -453,6 +455,8 @@ CUTLASS_DEVICE void gemm_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor
                 if (i == 0) { fn(); }
             }
             cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+            // Release dependent warp groups after this reduction fragment.
+            if constexpr (!std::is_same_v<FragmentHook, std::nullptr_t>) { after_fragment(i); }
         }
 #endif
     }

@@ -271,6 +271,35 @@ struct PagedKVManager {
 #endif
 
 #if defined(__HGGC_ARCH__) &&  __HGGC_ARCH__ >= 100 && defined(USE_PPU) && USE_AIU
+    // The caller guarantees one contiguous 64-token BF16 K/V page per tile,
+    // with Dqk=192 and Dv=128. Cache hints never change shared-memory ownership.
+    CUTLASS_DEVICE
+    void prefetch_kv_tile_llc(int const n_block) {
+#if !defined(FA3_HLLM_BUILD) && __HGGC_ARCH__ >= 150
+        static_assert(PagedKVAiu && !Is_QSA && kBlockN == 64 && kBlockNPagedPerAiuLoad == 64
+            && kHeadDim == 192 && kHeadDimV == 128 && sizeof(Element) == 2);
+        int const row = warp_idx * kBlockNPagedPerAiuLoad;
+        int const row_idx = n_block * kBlockN + row;
+        if (row < kBlockN && row_idx >= 0 && row_idx < seqlen_k) {
+            int page_offset;
+            int const page_idx = page_size_divmod.divmod(page_offset, row_idx + leftpad_k);
+            int const page = __ldg(&mPageTable[page_idx]);
+            int const lane = thread_idx % 32;
+            char *kptr = reinterpret_cast<char*>(&mK_paged(page_offset, _0{}, page));
+            char *vptr = reinterpret_cast<char*>(&mV_paged(page_offset, _0{}, page));
+            constexpr int kCacheLineBytes = 128;
+            #pragma unroll
+            for (int off = 0; off < kBlockNPagedPerAiuLoad * kHeadDim * sizeof(Element); off += 32 * kCacheLineBytes) {
+                __ppu_prefetch_nonebulk_LLC(kptr + off + lane * kCacheLineBytes);
+            }
+            #pragma unroll
+            for (int off = 0; off < kBlockNPagedPerAiuLoad * kHeadDimV * sizeof(Element); off += 32 * kCacheLineBytes) {
+                __ppu_prefetch_nonebulk_LLC(vptr + off + lane * kCacheLineBytes);
+            }
+        }
+#endif
+    }
+
     CUTLASS_DEVICE
     void prefetch_page_table(const int n_block) {
 #ifndef FA3_HLLM_BUILD
