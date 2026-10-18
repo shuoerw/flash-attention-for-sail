@@ -1,115 +1,156 @@
-# Kimi K3 SM89 warp-interleaving evaluation
+# Kimi K3 SM89 warp-interleaving validation
 
-Validated on 2026-10-16 in node78's `shuoer_mimo` container, on ZW-M890P
-(SM89, 39 CUs). The final performance sweep used GPU7 under
-`/tmp/shuoer-node78-ppu7.lock`; device process checks showed no competing GPU7
-job. An earlier GPU4 sweep was interrupted after another user's job appeared
-on that device. Its overlapping timings are excluded from the conclusions.
+Validated on 2026-10-18 in node78's `shuoer_mimo` container, on ZW-M890P
+(SM89, 39 CUs). GPU4 and GPU7 were used under their shared device locks.
+Device-process checks showed no competing jobs on those devices. The resident
+serving processes on GPUs 0–3 were not changed.
 
 ## Scope and decision
 
-Both sides use the original N64 tile policy, the original M64/four-warp or
-M128/eight-warp selection, and one shared K tile plus one shared V tile.
-The interleaved candidate changes warp scheduling only. Dense prefill has no
-LLC-prefetch extension. B counts requests per TP8 replica; every TP rank
-processes its own 12-head shard.
+Every comparison uses the original N64 tile policy, original M64/four-warp
+or M128/eight-warp selection, and one shared K tile plus one shared V tile.
+There are no changes to tiling, stage count, split count, math, or prefetch.
+B counts requests per TP8 replica; each TP rank processes its 12-head shard.
 
-The candidate does not meet the approximately 1% regression allowance.
-The production dense dispatcher therefore retains the original kernel.
-The N96 override and average-KV eligibility gate have been removed.
-An explicit N64 candidate remains available as test mode 1; mode 8 exercises
-the unchanged production dense dispatcher. Earlier combined N96/interleaving
-gains are not evidence for this WI-only candidate.
+The revised WI schedule provides measurable gains on the original tiles.
+It removes the previous 2–3% regression in the two repeated cached-prefix
+signal cases. Across the 30-case context sweep, observed latency changes
+range from -4.15% to +1.07%, including mixed 64K chunks and 1M KV.
 
-## Correctness and build checks
+The production dense dispatcher remains on the original schedule: short
+inputs and some small ragged batches still exceed the approximately 1%
+regression allowance. No new workload eligibility heuristic is introduced.
+Test mode 1 exercises WI; mode 8 exercises the unchanged production dispatcher.
 
-The 30-case context sweep checks complete output and LSE bit for bit against
-the original N64 schedule. Small workloads use full FP32 references; larger
-workloads check sampled query rows and every head against the full live KV.
-All 30 cases pass, including output, LSE, and scheduler guard regions.
+## Scheduling correction
 
-Coverage includes causal and noncausal 4K chunks from 4K through 1M KV,
-full prompts and 64K query chunks, the mixed queries
-`[4096,8192,32768,20480]` with live KV
-`[4096,8192,98304,151552]`, the longer-prefix variant ending at 1M KV,
-and the removed upper-limit boundary cases.
+Dense prefill uses three named-barrier phases in the existing core loop:
 
-The final build passes four dense dispatch checks and two compile-time
-original-tiling assertions, plus all 61 paged MiMo selector checks. Five
-unaffected dtype/dimension/layout templates compile. All 32 device-kernel
-bodies match the N64 trial build exactly; its 27 original-schedule bodies
-also match the preceding validated baseline. The final adapter preserves
-M16 fallback in both baseline and candidate mode.
+1. The leading group completes next K before joining `VReadersDone`.
+   That phase also retires the trailing group's previous PV reads.
+2. The leading group issues the existing V copy before entering QK and
+   releases the trailing group after two reduction fragments.
+3. Trailing warps wait at `KReadersDone` after QK. The leading group joins
+   after completing the V copy, so this phase also publishes V. No separate
+   V-ready wait is needed before PV.
 
-The final rebuilt adapter also passes eight smoke, 21 safety, and 27
-mixed-length boundary cases, checking both the explicit candidate and the
-restored production dispatcher. All 56 pass exact output/LSE, FP32 reference,
-and guard-region checks.
+This removes the dense leading-group-only barrier and separate V-ready
+phase. Moving the V copy out of the QK fragment hook removes a role-dependent
+branch from that instruction sequence. Paged MiMo keeps its existing protocol.
 
-The test requires exact native output/LSE comparisons; there is no
-different-tile reduction-tolerance option. The explicit WI candidate is
-checked directly against FP32 even when the production dispatcher takes
-the original kernel.
+## Correctness and build validation
 
-## WI-only performance
+All 30 context cases pass complete, bit-exact output and LSE comparisons,
+FP32 reference checks, and output/LSE/scheduler guard checks. Small problems
+use full FP32 references; large problems use sampled query rows, all heads,
+and the full live KV. Coverage includes:
 
-The signal comparison uses 101 samples per variant; the 30-case context
-sweep uses 11. Both randomize variant order, evict 256 MiB between samples,
-and include an identical A/A baseline. The table uses the faster baseline
-median and the 101-sample signal result where available. Positive values
-mean slower. Measurements cover the attention operator, not model serving.
+- Causal and noncausal Q4K with KV from 4K to 1M.
+- Fresh prompts and query chunks up to 64K.
+- Mixed queries `[4096,8192,32768,20480]`, with live KV
+  `[4096,8192,98304,151552]` or `[4096,8192,524288,1048576]`.
+- Partial-tile Q65537/KV1048577 and 257 short requests sharing a chunk.
 
-| New queries | Live KV | Attention | Latency change |
+The cleaned build also passes 8 smoke, 21 safety, and 27 boundary cases.
+These check mode 1 and production mode 8, including empty requests, M16
+fallback, different head counts, and contiguous/strided V.
+
+All 32 cleaned dense device-kernel bodies are byte-identical to the tested
+candidate. All 28 baseline/scheduler bodies checked against the previous
+build are unchanged. Four dense host-dispatch checks and two compile-time
+original-tile assertions pass. Five unaffected template paths compile.
+All 171 before/after paged MiMo kernel bodies are byte-identical, and all
+61 paged selector contract checks pass. The dense correction therefore
+preserves the compiled MiMo kernels and their selection policy.
+
+## Operator performance
+
+Numbers below are latency changes relative to the faster identical A/A
+baseline median; negative means faster. Variant order is randomized, with
+256 MiB eviction before each sample. Timings include semaphore initialization
+and the attention operator, excluding projections, prefix assembly, Python
+API overhead, and serving scheduling.
+
+The following comparisons use 101 samples per variant in one process,
+with identical inputs and original tiling:
+
+| New Q | Live KV | Causal | Previous WI | Fixed WI |
+| --- | --- | --- | ---: | ---: |
+| 4K | 4K | yes | -1.28% | -3.18% |
+| 16K | 16K | yes | -0.52% | -2.93% |
+| 2K | 32K | yes | +2.31% | -1.29% |
+| 2K | 128K | no | +2.04% | -0.90% |
+
+A separate 51-sample run measured -0.79% and -0.91% for the two cached-prefix
+cases. Within-run paired-bootstrap 95% intervals in the 101-sample run are
+[-1.46%, -0.95%] and [-0.96%, -0.83%]. These intervals describe timing
+uncertainty within that run, not all possible inputs or system conditions.
+
+The 30-case context sweep uses 11 samples per variant:
+
+| New Q | Live KV | Causal | Fixed WI |
 | --- | --- | --- | ---: |
-| 4K | 4K | causal | -1.03% |
-| 16K | 16K | causal | -0.49% |
-| 64K | 64K | causal | -0.05% |
-| 2K | 128K | noncausal | +2.04% |
-| 4K | 128K | causal | +2.80% |
-| 4K | 1M | causal | +3.25% |
-| 64K | 1M | causal | +3.26% |
-| mixed 64K | 4K / 8K / 96K / 148K | causal | +1.97% |
-| mixed 64K | 4K / 8K / 512K / 1M | causal | +2.23% |
+| 4K | 8K | yes | +1.07% |
+| 4K | 16K | yes | -1.99% |
+| 4K | 32K | yes | +0.68% |
+| 4K | 128K | yes | -0.62% |
+| 4K | 1M | yes | -0.17% |
+| 8K | 8K | yes | -4.15% |
+| 32K | 32K | yes | -3.75% |
+| 64K | 64K | yes | -2.41% |
+| 64K | 1M | yes | -1.53% |
+| mixed 64K | 4K / 8K / 96K / 148K | yes | -1.53% |
+| mixed 64K | 4K / 8K / 512K / 1M | yes | -0.85% |
+| 65537 | 1048577 | yes | -0.62% |
 
-Short-case regressions also occur. These results do not justify enabling
-the candidate generally or claiming that WI provides the previous
-combined tiling/scheduling speedups.
+Isolated 101-sample repeats of Q4K/KV8K and Q4K/KV32K measured -0.10% and
+-0.63%. The full-sweep +1.07% observation is retained as the measured upper
+regression, rather than replacing it with a favorable repeat. Selecting cases
+changes the random-input stream because replay seeds once per invocation.
 
-## Scheduling diagnosis
+Short-case limitations remain: the final safety run measured +8.02% for
+Q64/KV64, +4.15% for Q127/KV127, and +2.48% for Q705/KV705. The boundary run
+measured +4.34% for 31 Q64/KV128 requests plus one Q512/KV64K request.
+These results prevent unconditional dense enablement.
 
-A same-N64 profile of Q2K/KV128K noncausal attention shows identical tensor
-instruction counts, 240 registers per thread, and 48 KiB shared memory
-for baseline and candidate. WI increases issued instructions by 3.27%.
-The profiler's compute-dependency stall ratio decreases from 0.197 to
-0.084, while its instruction-fetch stall ratio increases from 0.062 to
-0.119. These are ratios per active issue, not utilization percentages.
-Tensor active cycles over elapsed cycles decrease from 41.21% to 40.33%.
+## Hardware evidence
 
-This supports partial dependency hiding offset by additional execution and
-scheduling overhead. It does not establish hardware saturation or prove
-that no better WI schedule exists.
+Fixed-seed profiles of causal Q4K/KV32K use exactly the same tensors for all
+three schedules. Each uses 240 registers/thread and 48 KiB shared memory,
+with identical tensor and floating-point multiplication instruction counts.
 
-Three isolated, same-tiling scheduling probes passed their tested exact
-numerical comparisons but failed to fix the performance problem:
+| Metric | Original | Previous WI | Fixed WI |
+| --- | ---: | ---: | ---: |
+| Issued instructions | 734,348,125 | 763,497,805 | 752,441,053 |
+| Branch instructions | 4,587,727 | 14,915,791 | 11,966,671 |
+| Compute-dependency stall ratio | 0.181 | 0.083 | 0.087 |
+| Instruction-fetch stall ratio | 0.061 | 0.117 | 0.105 |
+| Tensor active / elapsed | 48.05% | 46.78% | 48.33% |
+| FP32/FP16 ALU active / elapsed | 15.75% | 15.39% | 15.67% |
+| SFU active / elapsed | 20.61% | 19.86% | 20.59% |
 
-- Earlier next-K refill improved some short cases, but Q2K/KV128K remained
-  about 2% slower than the original.
-- Allowing initial QK fragments before the previous-V-reader wait made that
-  case 5.41% slower.
-- Alternating leading/trailing warp membership reduced that regression to
-  1.13%, but made Q512/KV8K 8.50% slower.
+Stall ratios are per active issue, not utilization percentages. The measured
+gain comes from retaining dependency overlap while reducing synchronization
+and control-flow overhead. The compiler also overlaps softmax and PV within
+a warp. These profiles do not establish saturation or a universal WI limit.
+Profiler durations are not used as the operator benchmark results.
 
-None of these probes is included in production source.
+## Reproduction and evidence
 
-## Evidence and limits
+Source snapshots, build hashes, complete samples, rejected scheduling probes,
+and profiles are under `/o-work/shuoer/dev/fa-kimi-wi-only-20261018`.
 
-Raw results, compiler manifests, source snapshots, and profiles are retained
-under `/o-work/shuoer/dev/fa-kimi-wi-only-20261016`. Primary files are
-`results/gpu7-probes-signal.json`, `results/gpu7-n64-contexts.json`,
-`results/final-machine-code.json`, and `profiles/m{0,8}-raw.csv`.
-The trial adapter's mode 8 selected WI; final test mode 1 instantiates the
-same device body. Final production mode 8 retains the original schedule.
+Primary files:
 
-These are standalone adapter tests, not a full Python-package installation
-or a serving deployment. They establish failure of this candidate's
-performance acceptance test, not a universal limit of warp interleaving.
+- `results/winner-repeat.json`, `results/winner-bootstrap.json`.
+- `results/load-setup-contexts.json`, `results/context-summary.json`.
+- `results/final-{smoke,safety,boundaries,prefix-repeat}.json`.
+- `results/final-body-identity.json`, `results/baseline-body-identity.json`.
+- `results/mimo-body-identity.json`, `mimo-{before,after}/build.json`.
+- `profiles/seed1731-{original,old-wi,final}-raw.csv`.
+- `final/build.json`, `final/compile_coverage.json`.
+
+The `load-setup` experimental library and cleaned `final` library emit identical
+device instructions. Experimental variants are retained only in the external
+evidence directory; they are not added to production source. Validation uses
+standalone adapters, not a package installation or serving deployment.

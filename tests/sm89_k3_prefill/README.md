@@ -15,16 +15,22 @@ stage count, and split count stay identical in the comparison. The only
 candidate scheduling change is named-barrier warp interleaving.
 
 The leading half of the warps releases the trailing half after two QK
-reduction fragments. The barrier protocol is shared with paged prefill;
-see `../sm89_prefill/README.md` for the K/V lifetime and barrier phases.
-Dense prefill does not use the paged LLC-prefetch extension.
+reduction fragments. Dense prefill uses three named-barrier phases:
+`VReadersDone` retires previous V readers and publishes next K to the leading
+group; `QkHandoff` releases the trailing QK group; `KReadersDone` retires
+current K readers and publishes current V. The existing V copy is issued in
+leading-warp setup before QK, avoiding a conditional copy hook inside the
+fragment loop. Paged prefill retains its separate publication phases;
+see `../sm89_prefill/README.md`. Dense prefill does not use LLC prefetch.
 
 The explicit candidate is tested on SM89 BF16 D192/V128, 12 equal Q/KV
 heads, dense varlen layouts, one KV split, and M64/M128. It preserves the
 ordinary M16 fallback. Causal full prefill and noncausal attention to cached
 prefixes are both covered. The candidate is not selected by the production
-dense dispatcher because its measured regressions exceed the acceptance limit.
-No average-KV gate is used to hide those regressions.
+dense dispatcher because short inputs and some small ragged batches still
+regress. The 4K–1M prefill evaluation shows WI-only gains with a largest
+observed regression of approximately 1%. No context, batch, or average-KV
+eligibility gate is added to select favorable cases.
 
 Output and LSE must match the original kernel bit for bit. Both schedules use
 the same reduction grouping. Static assertions also check that the ordinary
@@ -70,5 +76,6 @@ Timing captures one attention call per graph, including semaphore initialization
 randomizes variant order, evicts 256 MiB before each sample, and includes an
 identical A/A control. JSON retains all timing samples. These are attention
 operator timings, excluding model projections, prefix assembly, the Python
-API, and serving scheduling. `profile.py` isolates one warmed kernel for ACU.
+API, and serving scheduling. `profile.py` isolates one warmed kernel for ACU
+and uses a reproducible seed (`--seed`, default 1731).
 See `VALIDATION.md` for results and limitations.

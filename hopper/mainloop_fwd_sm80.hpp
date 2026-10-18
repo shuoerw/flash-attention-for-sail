@@ -131,8 +131,10 @@ struct CollectiveMainloopFwdSm80 {
         ? kNWarps / 2 : Sm89PrefillConfig::LeadingWarps;
     static constexpr int kQkHandoffFragments = Sm89PrefillConfig::QkHandoffFragments;
     static_assert(!PrefillInterleave || (kLeadingWarps > 0 && kLeadingWarps < kNWarps));
-    // Cross-group phases include all MMA threads; LeadingGroupReady includes
-    // only the leading group. Every phase drains before the epilogue.
+    // Cross-group phases include all MMA threads. Dense prefill combines
+    // K publication with VReadersDone and V publication with KReadersDone.
+    // Paged prefill also uses LeadingGroupReady and VReady. Every phase drains
+    // before the epilogue.
     struct PrefillBarrier {
         static constexpr int QkHandoff = 0;
         static constexpr int KReadersDone = 1;
@@ -1100,12 +1102,15 @@ struct CollectiveMainloopFwdSm80 {
 #if defined(USE_PPU) && USE_AIU
             if constexpr (PrefillInterleave) {
                 if (warp_idx < kLeadingWarps) {
-                    // Finish current V before committing next K. The K-reader
-                    // barrier also retires the first tile's CTA-wide V zero-fill.
+                    // Finish current V before committing next K. Dense trailing
+                    // warps wait here, so this phase also publishes V to them.
+                    // For paged KV it retires the first tile's CTA-wide zero-fill.
                     flash::cp_async_wait<0>();
                     cutlass::arch::NamedBarrier::sync(NumMmaThreads, PrefillBarrier::KReadersDone);
                     load_K_next();
-                    cutlass::arch::NamedBarrier::arrive(NumMmaThreads, PrefillBarrier::VReady);
+                    if constexpr (!DensePrefillInterleave) {
+                        cutlass::arch::NamedBarrier::arrive(NumMmaThreads, PrefillBarrier::VReady);
+                    }
                 }
             }
 #endif
@@ -1119,7 +1124,22 @@ struct CollectiveMainloopFwdSm80 {
             Tensor tSrS = partition_fragment_C(tiled_mma, select<0, 1>(TileShape_MNK{}));
             clear(tSrS);
 #if defined(USE_PPU) && USE_AIU
-            if constexpr (PrefillInterleave) {
+            if constexpr (DensePrefillInterleave) {
+                // Issue V before entering QK: a conditional copy hook inside
+                // the fragment loop adds control flow to the MMA sequence.
+                if constexpr (Is_first_iter) {
+                    sync();
+                    load_V(n_block, 0, cute::true_type{});
+                    cute::cp_async_fence();
+                } else if (warp_idx < kLeadingWarps) {
+                    // Warp 0 completes next K before this phase publishes K
+                    // to the leading group and retires all previous V readers.
+                    flash::cp_async_wait<0>();
+                    cutlass::arch::NamedBarrier::sync(NumMmaThreads, PrefillBarrier::VReadersDone);
+                    load_V(n_block, 0, cute::false_type{});
+                    cute::cp_async_fence();
+                }
+            } else if constexpr (PrefillInterleave) {
                 if constexpr (Is_first_iter) {
                     sync();
                 } else if (warp_idx < kLeadingWarps) {
@@ -1182,7 +1202,8 @@ struct CollectiveMainloopFwdSm80 {
                     flash::gemm_sm80<Q_in_regs>(
                         tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, 0),
                         tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K,
-                        load_V_next, release_trailing_qk);
+                        [&] { if constexpr (!DensePrefillInterleave) { load_V_next(); } },
+                        release_trailing_qk);
                 } else
 #endif
                 {
@@ -1201,7 +1222,13 @@ struct CollectiveMainloopFwdSm80 {
 #if defined(USE_PPU) && USE_AIU
             if constexpr (PrefillInterleave) {
                 if (warp_idx >= kLeadingWarps) {
-                    cutlass::arch::NamedBarrier::arrive(NumMmaThreads, PrefillBarrier::KReadersDone);
+                    if constexpr (DensePrefillInterleave) {
+                        // The leading group completes V before joining this
+                        // phase, allowing PV without a separate V-ready wait.
+                        cutlass::arch::NamedBarrier::sync(NumMmaThreads, PrefillBarrier::KReadersDone);
+                    } else {
+                        cutlass::arch::NamedBarrier::arrive(NumMmaThreads, PrefillBarrier::KReadersDone);
+                    }
                 }
             }
 #endif
@@ -1312,8 +1339,10 @@ struct CollectiveMainloopFwdSm80 {
 #if defined(USE_PPU) && USE_AIU
             if constexpr (PrefillInterleave) {
                 refill_k_and_publish_v();
-                if (warp_idx >= kLeadingWarps) {
-                    cutlass::arch::NamedBarrier::sync(NumMmaThreads, PrefillBarrier::VReady);
+                if constexpr (!DensePrefillInterleave) {
+                    if (warp_idx >= kLeadingWarps) {
+                        cutlass::arch::NamedBarrier::sync(NumMmaThreads, PrefillBarrier::VReady);
+                    }
                 }
             }
 #endif
