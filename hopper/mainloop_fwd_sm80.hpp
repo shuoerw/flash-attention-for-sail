@@ -34,7 +34,7 @@ template <int kNWarps, int Stages, bool Q_in_regs, class TileShape_MNK_, int kHe
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKV_, bool AppendKV_,
 #endif
         bool PackGQA_, bool Split_, class ElementSAux_, bool Is_QSA_=false
-          , class QsaConfig = flash::QsaConfig
+          , class QsaConfig = flash::QsaConfig, bool PrefillLlcPrefetch = false
           >
 struct CollectiveMainloopFwdSm80 {
 
@@ -102,6 +102,18 @@ struct CollectiveMainloopFwdSm80 {
     static constexpr int kBlockM = get<0>(TileShape_MNK{});
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
+
+#if defined(USE_PPU) && USE_AIU && !defined(FA3_HLLM_BUILD)
+    static_assert(!PrefillLlcPrefetch || (ArchTag::kMinComputeCapability == 89
+        && cute::is_same_v<Element, cutlass::bfloat16_t>
+        && kHeadDim == 192 && kHeadDimV == 128 && kStages == 1 && Q_in_regs
+        && Varlen && !Is_local && !AppendKV && !Has_softcap && !Is_QSA
+        && kBlockM == 64 && kBlockN == 64 && kNWarps == 4 && PagedKV && PagedKVAiu
+        && kBlockNPagedPerAiuLoad == 64 && PackGQA && Is_causal),
+        "SM89 prefill LLC prefetch requires a supported BF16 one-stage AIU specialization");
+#else
+    static_assert(!PrefillLlcPrefetch, "SM89 prefill LLC prefetch requires the PPU AIU backend");
+#endif
 
 #ifdef USE_PPU
     // Each warp executes QK. Give every warp the same valid score
@@ -837,6 +849,8 @@ struct CollectiveMainloopFwdSm80 {
         );
 #endif
 
+        // Preserve the cache-hint crossover in live N64 tiles, after KV splitting.
+        bool const prefetch_kv_tile = n_block - n_block_min + 1 >= 512;
         auto load_K = [&] (int const n_block, int const smem_pipe_write, auto need_seqlenk_masking_type) {
             static constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
             if constexpr (!PagedKV) {
@@ -860,6 +874,13 @@ struct CollectiveMainloopFwdSm80 {
                 paged_kv_manager.template load_page_table<Seqlenk_mask>(n_block);
                 paged_kv_manager.template load_K<Seqlenk_mask>(n_block, sK(_, _, smem_pipe_write));
 #if defined(USE_PPU) && USE_AIU
+                if constexpr (PrefillLlcPrefetch) {
+                    // Descending traversal: fill cache for the next tile without
+                    // allocating another shared-memory slot or changing barriers.
+                    if (prefetch_kv_tile && n_block - 1 >= n_block_min) {
+                        paged_kv_manager.prefetch_kv_tile_llc(n_block - 1);
+                    }
+                }
                 if constexpr (PagedKVAiu && kBlockM == 16) {   // only memory-bound cases care about memory loading costs.
                     paged_kv_manager.prefetch_page_table(n_block + 32);   // only long-distance prefetch works, 32 is an empirical number.
                 }

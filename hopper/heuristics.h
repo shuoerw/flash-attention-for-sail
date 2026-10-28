@@ -7,6 +7,50 @@
 
 #include <vector>
 
+#if defined(USE_PPU) && USE_AIU && !defined(FA3_HLLM_BUILD)
+#include "flash.h"
+
+namespace flash {
+
+// Layout eligibility and minimum work for SM89 paged prefill LLC prefetch.
+// Query tiling and KV splits are selected by the ordinary forward dispatcher.
+inline bool use_sm89_prefill_llc_prefetch(Flash_fwd_params const& p) {
+    constexpr int kMinKvTokens = 32769;
+    constexpr int kMinQueryTilesPerSm = 3;
+    if (p.arch != 89 || !p.is_bf16 || p.is_local || p.is_qsa
+        || p.use_kblockm_16 || p.use_kblockn_16 || p.num_sm <= 0
+        || p.num_splits < 1 || p.num_splits > 256
+        || p.b <= 0 || p.total_q <= 0 || p.seqlen_q <= 16
+        || p.d != 192 || p.dv != 128 || !p.cu_seqlens_q
+        || p.seqused_q || p.leftpad_k || p.kv_batch_idx
+        || p.knew_ptr || p.vnew_ptr || p.qv_ptr || p.rotary_cos_ptr
+        || p.softcap != 0.f || p.attention_chunk != 0
+        || p.q_head_stride != 192 || p.q_row_stride != p.h * 192
+        || p.o_head_stride != 128 || p.o_row_stride != p.h * 128
+        || p.v_dim_stride != 1) {
+        return false;
+    }
+    if (p.page_table) {
+        if (!p.is_causal || !p.pack_gqa || p.use_kblockm_128
+            || p.h != 16 || p.h_k != 1 || p.page_size != 64
+            || !p.seqused_k || p.cu_seqlens_k
+            || p.seqlen_k < kMinKvTokens
+            || p.k_row_stride != 192 || p.k_batch_stride != 64 * 192
+            || p.v_row_stride != 128 || p.v_batch_stride != 64 * 128) {
+            return false;
+        }
+        int64_t const query_tiles = (int64_t(p.total_q) * p.h + 63) / 64;
+        if (query_tiles < kMinQueryTilesPerSm * p.num_sm) {
+            return false;
+        }
+        return true;
+    }
+    return false;
+}
+
+}  // namespace flash
+#endif
+
 #ifdef USE_PPU
 inline bool should_pack_gqa(bool varlen_q, int seqlen_q, int num_qhead, int num_khead, int blockM_nopack, int blockM_pack, int num_SMs) {
     // If varlen, we don't actually know seqlen_q but only max_seqlen_q.
