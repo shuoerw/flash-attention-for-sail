@@ -408,7 +408,7 @@ CUTLASS_DEVICE void gemm(TiledMma& tiled_mma, Tensor0 const& tCrA, Tensor1 const
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<bool A_in_regs=false, bool B_in_regs=false, bool SwapAB=false,
+template<bool A_in_regs=false, bool B_in_regs=false, bool SwapAB=false, bool StaggerK=false,
          typename Tensor0, typename Tensor1,
          typename Tensor2, typename Tensor3, typename Tensor4,
          typename TiledMma, typename TiledCopyA, typename TiledCopyB,
@@ -418,7 +418,7 @@ CUTLASS_DEVICE void gemm_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor
                               TiledCopyA smem_tiled_copy_A, TiledCopyB smem_tiled_copy_B,
                               ThrCopyA smem_thr_copy_A, ThrCopyB smem_thr_copy_B, Hook fn) {
     if constexpr (SwapAB) {
-        gemm_sm80<B_in_regs, A_in_regs>(acc, tCrB, tCrA, tCsB, tCsA, tiled_mma, smem_tiled_copy_B, smem_tiled_copy_A, smem_thr_copy_B, smem_thr_copy_A, fn);
+        gemm_sm80<B_in_regs, A_in_regs, false, StaggerK>(acc, tCrB, tCrA, tCsB, tCsA, tiled_mma, smem_tiled_copy_B, smem_tiled_copy_A, smem_thr_copy_B, smem_thr_copy_A, fn);
     } else {
         CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));                     // MMA_M
         CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));                     // MMA_N
@@ -430,14 +430,34 @@ CUTLASS_DEVICE void gemm_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor
 #ifdef USE_PPU
         #pragma hggc mmatiestrictly
         {
-        #pragma unroll
-        for (int i = 0; i < size<2>(tCrA); ++i) {
-            if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, i), tCrA_copy_view(_, _, i)); }
-            if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, i), tCrB_copy_view(_, _, i)); }
-            if constexpr (!std::is_same_v<Hook, std::nullptr_t>) {
-                if (i == 0) { fn(); }
+        if constexpr (StaggerK) {
+            // Odd warps start halfway through K. Every fragment is consumed
+            // once, with compile-time indices and an unchanged load callback.
+            auto run_rotated = [&](auto rotate_type) {
+                #pragma unroll
+                for (int step = 0; step < size<2>(tCrA); ++step) {
+                    constexpr bool rotate = decltype(rotate_type)::value;
+                    int const i = (step + (rotate ? size<2>(tCrA) / 2 : 0)) % size<2>(tCrA);
+                    if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, i), tCrA_copy_view(_, _, i)); }
+                    if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, i), tCrB_copy_view(_, _, i)); }
+                    if constexpr (!std::is_same_v<Hook, std::nullptr_t>) {
+                        if (step == 0) { fn(); }
+                    }
+                    cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+                }
+            };
+            if ((threadIdx.x / cutlass::NumThreadsPerWarp) & 1) { run_rotated(cute::true_type{}); }
+            else { run_rotated(cute::false_type{}); }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < size<2>(tCrA); ++i) {
+                if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, i), tCrA_copy_view(_, _, i)); }
+                if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, i), tCrB_copy_view(_, _, i)); }
+                if constexpr (!std::is_same_v<Hook, std::nullptr_t>) {
+                    if (i == 0) { fn(); }
+                }
+                cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
             }
-            cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
         }
         }
 #else
@@ -516,7 +536,7 @@ CUTLASS_DEVICE void gemm_sm80_kv_paged_aiu(Tensor0 &acc, Tensor1 &tCrA, Tensor2 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
+template<bool StaggerK=false, typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
          typename TiledMma, typename TiledCopy, typename ThrCopy>
 CUTLASS_DEVICE void gemm_rs_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsB,
                                  TiledMma tiled_mma, TiledCopy smem_tiled_copy_B,
@@ -529,10 +549,24 @@ CUTLASS_DEVICE void gemm_rs_sm80(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Ten
 #ifdef USE_PPU
     #pragma hggc mmatiestrictly
     {
-    #pragma unroll
-    for (int i = 0; i < size<2>(tCrA); ++i) {
-        cute::copy(smem_tiled_copy_B, tCsB(_, _, i), tCrB_copy_view(_, _, i));
-        cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+    if constexpr (StaggerK) {
+        auto run_rotated = [&](auto rotate_type) {
+            #pragma unroll
+            for (int step = 0; step < size<2>(tCrA); ++step) {
+                constexpr bool rotate = decltype(rotate_type)::value;
+                int const i = (step + (rotate ? size<2>(tCrA) / 2 : 0)) % size<2>(tCrA);
+                cute::copy(smem_tiled_copy_B, tCsB(_, _, i), tCrB_copy_view(_, _, i));
+                cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+            }
+        };
+        if ((threadIdx.x / cutlass::NumThreadsPerWarp) & 1) { run_rotated(cute::true_type{}); }
+        else { run_rotated(cute::false_type{}); }
+    } else {
+        #pragma unroll
+        for (int i = 0; i < size<2>(tCrA); ++i) {
+            cute::copy(smem_tiled_copy_B, tCsB(_, _, i), tCrB_copy_view(_, _, i));
+            cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+        }
     }
     }
 #else

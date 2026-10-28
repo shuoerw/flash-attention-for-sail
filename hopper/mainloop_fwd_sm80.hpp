@@ -34,7 +34,7 @@ template <int kNWarps, int Stages, bool Q_in_regs, class TileShape_MNK_, int kHe
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKV_, bool AppendKV_,
 #endif
         bool PackGQA_, bool Split_, class ElementSAux_, bool Is_QSA_=false
-          , class QsaConfig = flash::QsaConfig
+          , class QsaConfig = flash::QsaConfig, bool PrefillFragmentStagger = false
           >
 struct CollectiveMainloopFwdSm80 {
 
@@ -102,6 +102,18 @@ struct CollectiveMainloopFwdSm80 {
     static constexpr int kBlockM = get<0>(TileShape_MNK{});
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
+
+#if defined(USE_PPU) && USE_AIU && !defined(FA3_HLLM_BUILD)
+    static_assert(!PrefillFragmentStagger || (ArchTag::kMinComputeCapability == 89
+        && cute::is_same_v<Element, cutlass::bfloat16_t>
+        && kHeadDim == 192 && kHeadDimV == 128 && kStages == 1 && Q_in_regs
+        && Varlen && !Is_local && !AppendKV && !Has_softcap && !Is_QSA
+        && kBlockM == 64 && kBlockN == 64 && kNWarps == 4 && PagedKV && PagedKVAiu
+        && kBlockNPagedPerAiuLoad == 64 && PackGQA && Is_causal),
+        "SM89 prefill fragment staggering requires a supported BF16 one-stage AIU specialization");
+#else
+    static_assert(!PrefillFragmentStagger, "SM89 prefill fragment staggering requires the PPU AIU backend");
+#endif
 
 #ifdef USE_PPU
     // Each warp executes QK. Give every warp the same valid score
@@ -1072,7 +1084,7 @@ struct CollectiveMainloopFwdSm80 {
                     tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, load_V_next
                 );
             } else {
-                flash::gemm_sm80<Q_in_regs>(
+                flash::gemm_sm80<Q_in_regs, false, false, PrefillFragmentStagger>(
                     tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0),
                     tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, load_V_next
                 );
@@ -1239,7 +1251,7 @@ struct CollectiveMainloopFwdSm80 {
                     tOrO, tOrP, tOrV, shared_storage.tensors.mainloop.smem_v.data(),
                     kStages > 1 ? smem_pipe_read : 0, tiled_mma);
             } else {
-                flash::gemm_rs_sm80(tOrO, tOrP, tOrV, tOsVt(_, _, _, kStages > 1 ? smem_pipe_read : 0), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+                flash::gemm_rs_sm80<PrefillFragmentStagger>(tOrO, tOrP, tOrV, tOsVt(_, _, _, kStages > 1 ? smem_pipe_read : 0), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
             }
 #else
             flash::gemm_rs_sm80(tOrO, tOrP, tOrV, tOsVt(_, _, _, kStages > 1 ? smem_pipe_read : 0), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
