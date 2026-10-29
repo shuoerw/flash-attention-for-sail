@@ -9,6 +9,9 @@
 #include <cutlass/array.h>
 #include <cutlass/numeric_types.h>
 #include <cutlass/numeric_conversion.h>
+#include <cutlass/arch/barrier.h>
+
+#include "tile_size.h"
 
 #include "cute/tensor.hpp"
 
@@ -34,7 +37,8 @@ template <int kNWarps, int Stages, bool Q_in_regs, class TileShape_MNK_, int kHe
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKV_, bool AppendKV_,
 #endif
         bool PackGQA_, bool Split_, class ElementSAux_, bool Is_QSA_=false
-          , class QsaConfig = flash::QsaConfig
+          , class QsaConfig = flash::QsaConfig,
+            bool PrefillInterleave = false
           >
 struct CollectiveMainloopFwdSm80 {
 
@@ -102,6 +106,35 @@ struct CollectiveMainloopFwdSm80 {
     static constexpr int kBlockM = get<0>(TileShape_MNK{});
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
+
+#if defined(USE_PPU) && USE_AIU && !defined(FA3_HLLM_BUILD)
+    static_assert(!PrefillInterleave || (ArchTag::kMinComputeCapability == 89
+        && cute::is_same_v<Element, cutlass::bfloat16_t>
+        && kHeadDim == 192 && kHeadDimV == 128 && kStages == 1 && Q_in_regs
+        && Varlen && !Is_local && !AppendKV && !Has_softcap && !Is_QSA
+        && kBlockM == 64 && kBlockN == 64 && kNWarps == 4 && PagedKV && PagedKVAiu
+        && kBlockNPagedPerAiuLoad == 64 && PackGQA && Is_causal),
+        "SM89 prefill interleaving requires a supported BF16 one-stage AIU specialization");
+#else
+    static_assert(!PrefillInterleave, "SM89 prefill interleaving requires the PPU AIU backend");
+#endif
+    // Every warp owns independent query rows. Warps 0/2 lead and warps 1/3
+    // follow. Warp 0 copies V; warp 1 overlaps the next K refill with softmax/PV.
+    // QK handoffs keep the groups' tensor and scalar work staggered.
+    static constexpr int kLeadingWarps = kNWarps / 2;
+    static constexpr int kQkHandoffFragments = 2;
+    static_assert(!PrefillInterleave || (kLeadingWarps > 0 && kLeadingWarps < kNWarps));
+    // Cross-group phases include all MMA threads. LeadingGroupReady only
+    // synchronizes the leading warps after their V-copy wait. NextTileReady
+    // publishes next K and retires all trailing reads of the current V slot.
+    // Every phase drains before the epilogue.
+    struct PrefillBarrier {
+        static constexpr int QkHandoff = 0;
+        static constexpr int KReadersDone = 1;
+        static constexpr int VReady = 2;
+        static constexpr int NextTileReady = 4;
+        static constexpr int LeadingGroupReady = 6;
+    };
 
 #ifdef USE_PPU
     // Each warp executes QK. Give every warp the same valid score
@@ -683,10 +716,15 @@ struct CollectiveMainloopFwdSm80 {
             gmem_tiled_copy_V.desc_ = AiuDesc{nullptr, seqlen_info.seqlen_k, get<0>(params.stride_V), kBlockN, kBlockKGmem, aiu_offset_v};
         }
         const int warp_idx = __ppu_read_firstlane(threadIdx.x / 32);
+        // Interleave even and odd warps without changing their query rows.
+        // Copy ownership follows this group mapping only in the WI specialization.
+        const int prefill_warp_idx = PrefillInterleave ? (((warp_idx & 1) << 1) | (warp_idx >> 1)) : warp_idx;
+        const int prefill_copy_thread = PrefillInterleave ? ((prefill_warp_idx << 5) | (thread_idx & 31)) : thread_idx;
         [[maybe_unused]] const int lane = threadIdx.x % 32;  // P3 only
         const int tid_thread_slice = warp_idx * 32;
 #else
         const int tid_thread_slice = thread_idx;
+        const int prefill_copy_thread = thread_idx;
 #endif
         // TSM uses a warp-uniform descriptor; LDSM uses lane-local addresses.
         int const qk_tid_thread_slice = QsaReplicateQK ? 0 : tid_thread_slice;
@@ -808,7 +846,7 @@ struct CollectiveMainloopFwdSm80 {
                     params.ptr_K, params.shape_K, params.stride_K,
                     params.ptr_V, params.headdim_v, params.stride_V,
                     params.page_size_divmod, params.page_size_divmod,
-                    bidb_kv, bidh_kv, thread_idx, Is_QSA ? std::min(seqlen_info.seqlen_k, int(get<1>(params.shape_pagetable))) : seqlen_info.seqlen_k, seqlen_info.leftpad_k,
+                    bidb_kv, bidh_kv, prefill_copy_thread, Is_QSA ? std::min(seqlen_info.seqlen_k, int(get<1>(params.shape_pagetable))) : seqlen_info.seqlen_k, seqlen_info.leftpad_k,
                     0 /*bidb_kv_idx, not used since we don't use TMA for Sm8x*/,
                     seqlen_info.offset_q, m_block
                 );
@@ -818,7 +856,7 @@ struct CollectiveMainloopFwdSm80 {
                     params.ptr_K, params.shape_K, params.stride_K,
                     params.ptr_V, params.headdim_v, params.stride_K,
                     params.page_size_divmod, params.page_size_divmod,
-                    bidb_kv, bidh_kv, thread_idx, Is_QSA ? std::min(seqlen_info.seqlen_k, int(get<1>(params.shape_pagetable))) : seqlen_info.seqlen_k, seqlen_info.leftpad_k,
+                    bidb_kv, bidh_kv, prefill_copy_thread, Is_QSA ? std::min(seqlen_info.seqlen_k, int(get<1>(params.shape_pagetable))) : seqlen_info.seqlen_k, seqlen_info.leftpad_k,
                     0 /*bidb_kv_idx, not used since we don't use TMA for Sm8x*/,
                     seqlen_info.offset_q, m_block
                 );
@@ -831,10 +869,27 @@ struct CollectiveMainloopFwdSm80 {
             params.ptr_V, params.headdim_v, params.stride_V,
             params.page_size_divmod,
             params.page_size_divmod /*blockN_per_page_size_divmod, not used since we don't use TMA*/,
-            bidb_kv, bidh_kv, thread_idx, Is_QSA ? std::min(seqlen_info.seqlen_k, int(get<1>(params.shape_pagetable))) : seqlen_info.seqlen_k, seqlen_info.leftpad_k,
+            bidb_kv, bidh_kv, prefill_copy_thread, Is_QSA ? std::min(seqlen_info.seqlen_k, int(get<1>(params.shape_pagetable))) : seqlen_info.seqlen_k, seqlen_info.leftpad_k,
             0 /*bidb_kv_idx, not used since we don't use TMA for Sm8x*/,
             seqlen_info.offset_q, m_block
         );
+#endif
+
+#if defined(USE_PPU) && USE_AIU
+        // Select the first trailing warp in the interleaved copy mapping for K.
+        // Its copy queue can advance while the leading group consumes V.
+        auto prefill_k_manager = [&] {
+            if constexpr (PrefillInterleave) {
+                return PagedKVManager_t(
+                    params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
+                    params.ptr_K, params.shape_K, params.stride_K,
+                    params.ptr_V, params.headdim_v, params.stride_V,
+                    params.page_size_divmod, params.page_size_divmod,
+                    bidb_kv, bidh_kv, prefill_copy_thread ^ (kLeadingWarps * 32),
+                    seqlen_info.seqlen_k, seqlen_info.leftpad_k, 0,
+                    seqlen_info.offset_q, m_block);
+            } else { return nullptr; }
+        }();
 #endif
 
         auto load_K = [&] (int const n_block, int const smem_pipe_write, auto need_seqlenk_masking_type) {
@@ -857,8 +912,16 @@ struct CollectiveMainloopFwdSm80 {
                     gmem_tiled_copy_K, tKgK(_, _, _, n_block), tKsK_cur, t0KcK, tKpK, seqlenk_row_limit);
 #endif
             } else {
-                paged_kv_manager.template load_page_table<Seqlenk_mask>(n_block);
-                paged_kv_manager.template load_K<Seqlenk_mask>(n_block, sK(_, _, smem_pipe_write));
+#if defined(USE_PPU) && USE_AIU
+                if constexpr (PrefillInterleave) {
+                    prefill_k_manager.template load_page_table<Seqlenk_mask>(n_block);
+                    prefill_k_manager.template load_K<Seqlenk_mask>(n_block, sK(_, _, smem_pipe_write));
+                } else
+#endif
+                {
+                    paged_kv_manager.template load_page_table<Seqlenk_mask>(n_block);
+                    paged_kv_manager.template load_K<Seqlenk_mask>(n_block, sK(_, _, smem_pipe_write));
+                }
 #if defined(USE_PPU) && USE_AIU
                 if constexpr (PagedKVAiu && kBlockM == 16) {   // only memory-bound cases care about memory loading costs.
                     paged_kv_manager.prefetch_page_table(n_block + 32);   // only long-distance prefetch works, 32 is an empirical number.
@@ -983,6 +1046,12 @@ struct CollectiveMainloopFwdSm80 {
             }
         };
 
+        if constexpr (PrefillInterleave) {
+            // V uses the same page as K, but is copied by another warp. Keep
+            // its page lookup outside the first QK fragment's critical path.
+            paged_kv_manager.template load_page_table<true>(n_block);
+        }
+
         // If Share_QV_Smem, we load Q, then load 1 stage of K, then (optionally) rotate Q and
         // read from smem_q to registers, then load V.
         // If !Share_QV, Smem, we load Q, load all stages of K & V, then (optionally) rotate Q.
@@ -1056,15 +1125,54 @@ struct CollectiveMainloopFwdSm80 {
             static constexpr bool Check_inf = decltype(check_inf_type)::value;
             Tensor tSrS = partition_fragment_C(tiled_mma, select<0, 1>(TileShape_MNK{}));
             clear(tSrS);
-            sync();
-            auto load_V_next = [&] {
-                if (n_block - kStages + 1 >= n_block_min) {
-                    load_V(n_block - kStages + 1, kStages > 1 ? smem_pipe_write : 0, cute::bool_constant<Is_first_iter && kStages == 1>{} /*Seqlenk_mask*/);
+#if defined(USE_PPU) && USE_AIU
+            if constexpr (PrefillInterleave) {
+                if constexpr (Is_first_iter) {
+                    sync();
+                } else if (prefill_warp_idx < kLeadingWarps) {
+                    // Next K is ready and the trailing V operands are in
+                    // registers. Its remaining PV math need not finish here.
+                    cutlass::arch::NamedBarrier::sync(NumMmaThreads, PrefillBarrier::NextTileReady);
                 }
-                cute::cp_async_fence();
+            } else
+#endif
+            { sync(); }
+            auto load_V_next = [&] {
+#if defined(USE_PPU) && USE_AIU
+                if constexpr (PrefillInterleave) {
+                    // NextTileReady protects V reuse. Each tile is one page,
+                    // and empty ranges returned before entering this loop.
+                    // AIU pads a partial page; no trailing page needs zero-fill.
+                    if (prefill_warp_idx < kLeadingWarps) {
+                        load_V(n_block, 0, cute::bool_constant<Is_first_iter>{});
+                        cute::cp_async_fence();
+                    }
+                } else
+#endif
+                {
+                    if (n_block - kStages + 1 >= n_block_min) {
+                        load_V(n_block - kStages + 1, kStages > 1 ? smem_pipe_write : 0, cute::bool_constant<Is_first_iter && kStages == 1>{} /*Seqlenk_mask*/);
+                    }
+                    cute::cp_async_fence();
+                }
             };
             Tensor tSrQ_cur = cute::conditional_return<Q_in_regs>(tSrQ, thr_mma_qk.partition_fragment_A(sQ));
             Tensor tSrK = thr_mma_qk.partition_fragment_B(sK(_, _, _0{}));
+#if defined(USE_PPU) && USE_AIU
+            auto release_trailing_qk = [&](int fragment) {
+                if constexpr (PrefillInterleave) {
+                    static_assert(kQkHandoffFragments <= decltype(size<2>(tSrQ_cur))::value);
+                    if (prefill_warp_idx < kLeadingWarps && fragment + 1 == kQkHandoffFragments) {
+                        cutlass::arch::NamedBarrier::arrive(NumMmaThreads, PrefillBarrier::QkHandoff);
+                    }
+                }
+            };
+            if constexpr (PrefillInterleave) {
+                if (prefill_warp_idx >= kLeadingWarps) {
+                    cutlass::arch::NamedBarrier::sync(NumMmaThreads, PrefillBarrier::QkHandoff);
+                }
+            }
+#endif
 #ifdef USE_PPU
             if constexpr (PagedKVAiu && (kBlockN != kBlockNPagedPerAiuLoad)) {
                 flash::gemm_sm80_kv_paged_aiu<kBlockN, kBlockNPagedPerAiuLoad, kHeadDim, kBlockKGmem, Q_in_regs>(
@@ -1072,10 +1180,20 @@ struct CollectiveMainloopFwdSm80 {
                     tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, load_V_next
                 );
             } else {
-                flash::gemm_sm80<Q_in_regs>(
-                    tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0),
-                    tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, load_V_next
-                );
+#if USE_AIU
+                if constexpr (PrefillInterleave) {
+                    flash::gemm_sm80<Q_in_regs>(
+                        tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, 0),
+                        tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K,
+                        load_V_next, release_trailing_qk);
+                } else
+#endif
+                {
+                    flash::gemm_sm80<Q_in_regs>(
+                        tSrS, tSrQ_cur, tSrK, tSsQ, tSsK(_, _, _, kStages > 1 ? smem_pipe_read : 0),
+                        tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, load_V_next
+                    );
+                }
             }
 #else
             flash::gemm_sm80<Q_in_regs>(
@@ -1083,11 +1201,26 @@ struct CollectiveMainloopFwdSm80 {
                 tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K, load_V_next
             );
 #endif
+#if defined(USE_PPU) && USE_AIU
+            if constexpr (PrefillInterleave) {
+                if (prefill_warp_idx < kLeadingWarps) {
+                    cutlass::arch::NamedBarrier::arrive(NumMmaThreads, PrefillBarrier::KReadersDone);
+                    if (n_block > n_block_min) {
+                        // Current V has already been issued. Look up its next
+                        // page while this tile's softmax and PV are computed.
+                        paged_kv_manager.template load_page_table<false>(n_block - 1);
+                    }
+                } else {
+                    cutlass::arch::NamedBarrier::sync(NumMmaThreads, PrefillBarrier::KReadersDone);
+                    load_K_next();
+                }
+            }
+#endif
             smem_pipe_write = smem_pipe_write < kStages - 1 ? smem_pipe_write + 1 : 0;
             scoremod_premask_fn(tSrS);
             // Faster to load_K before gemm if we only have 1 stage
 #ifdef USE_PPU
-            if constexpr (kStages == 1) {
+            if constexpr (kStages == 1 && !PrefillInterleave) {
                 // Adjust the loadV wait point according to the headdim.
                 // Smaller headdim coresponds to shorter QK gemm, and  PagedKV costs longer loading time,
                 // thus we need to move the wait point farther.
@@ -1188,6 +1321,18 @@ struct CollectiveMainloopFwdSm80 {
 #else
             if constexpr (!Is_first_iter) { softmax.rescale_o(tOrO, scores_scale); }
 #endif
+#if defined(USE_PPU) && USE_AIU
+            if constexpr (PrefillInterleave) {
+                if (prefill_warp_idx < kLeadingWarps) {
+                    flash::cp_async_wait<0>();
+                    cutlass::arch::NamedBarrier::sync(kLeadingWarps * 32, PrefillBarrier::LeadingGroupReady);
+                    cutlass::arch::NamedBarrier::arrive(NumMmaThreads, PrefillBarrier::VReady);
+                }
+                if (prefill_warp_idx >= kLeadingWarps) {
+                    cutlass::arch::NamedBarrier::sync(NumMmaThreads, PrefillBarrier::VReady);
+                }
+            }
+#endif
             // Fp8PvNsplit defer this sync
             if constexpr (!Fp8PvNsplit) {
                 if constexpr (kStages > 1) { sync(); }
@@ -1239,7 +1384,29 @@ struct CollectiveMainloopFwdSm80 {
                     tOrO, tOrP, tOrV, shared_storage.tensors.mainloop.smem_v.data(),
                     kStages > 1 ? smem_pipe_read : 0, tiled_mma);
             } else {
-                flash::gemm_rs_sm80(tOrO, tOrP, tOrV, tOsVt(_, _, _, kStages > 1 ? smem_pipe_read : 0), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+#if USE_AIU
+                if constexpr (PrefillInterleave) {
+                    auto release_next_tile = [&] {
+                        if (prefill_warp_idx >= kLeadingWarps) {
+                            // Finish the next K copy and retire this tile's V
+                            // reads before the leading group reuses either slot.
+                            // PV keeps using its register operands afterward.
+                            __ppu_sched_bound();
+                            flash::cp_async_wait<0>();
+                            // No next tile means no matching wait: leave no
+                            // partial phase for a persistent CTA's next task.
+                            if (n_block > n_block_min) {
+                                cutlass::arch::NamedBarrier::arrive(NumMmaThreads, PrefillBarrier::NextTileReady);
+                            }
+                        }
+                    };
+                    flash::gemm_rs_sm80(tOrO, tOrP, tOrV, tOsVt(_, _, _, 0), tiled_mma,
+                                       smem_tiled_copy_V, smem_thr_copy_V, release_next_tile);
+                } else
+#endif
+                {
+                    flash::gemm_rs_sm80(tOrO, tOrP, tOrV, tOsVt(_, _, _, kStages > 1 ? smem_pipe_read : 0), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+                }
             }
 #else
             flash::gemm_rs_sm80(tOrO, tOrP, tOrV, tOsVt(_, _, _, kStages > 1 ? smem_pipe_read : 0), tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
