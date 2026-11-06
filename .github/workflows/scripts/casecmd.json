@@ -21,6 +21,7 @@
     "hopper/test_flash_attn.py::test_flash_attn_kvcache",
     "hopper/test_flash_attn.py::test_flash_attn_cluster",
     "# hopper/test_flash_attn.py::test_flash_attn_race_condition # expect 60 failures",
-    "hopper/test_flash_attn.py::test_flash_attn_combine"
+    "hopper/test_flash_attn.py::test_flash_attn_combine",
+    "hopper/test_mimo_prefill.py"
   ]
 }
