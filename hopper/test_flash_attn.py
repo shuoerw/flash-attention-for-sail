@@ -1187,3 +1187,134 @@ def test_flash3_bw_compatibility() -> None:
         "int attention_chunk=0, bool has_softcap=False, int num_splits=0, bool? pack_gqa=None, "
         "int sm_margin=0) -> Tensor"
     ))
+
+
+@pytest.mark.skipif(cuda_cap != 89 or DISABLE_LOCAL
+                    or "ZW-M890" not in torch.cuda.get_device_name(),
+                    reason="PPU890 local attention required")
+@pytest.mark.parametrize("layout,page_size", [("packed", 0), ("paged", 64), ("paged", 128),
+                                             ("paged_varlen", 64), ("paged_varlen", 128)])
+@pytest.mark.parametrize("window_left", [511, 512])
+@pytest.mark.parametrize("has_sink", [False, True])
+@pytest.mark.parametrize("strided", [False, True])
+@torch.inference_mode()
+def test_d512_swa(layout, page_size, window_left, has_sink, strided):
+    """Full FP32 reference for ragged windows, paged layouts and FP32 sink."""
+    torch.manual_seed(512)
+    qs = [17] * 4 if layout == "paged" else [17, 3, 0, 33]
+    ks = [601, 0, 97, 513]
+    live_q = [max(n - 1, 0) for n in qs] if strided else qs
+    live_k = [max(n - 3, 0) for n in ks] if strided else ks
+    q = (torch.randn(sum(qs), 64, 512) * 0.3).bfloat16().cuda()
+    k = (torch.randn(sum(ks), 1, 512) * 0.3).bfloat16()
+    v = torch.randn_like(k) * 0.3
+    cu_q = torch.tensor([0, *itertools.accumulate(qs)], dtype=torch.int32, device="cuda")
+    cu_k = torch.tensor([0, *itertools.accumulate(ks)], dtype=torch.int32, device="cuda")
+    sink = torch.linspace(-4.003, 6.019, 64) if has_sink else None
+    kwargs = dict(causal=True, window_size=(window_left, 0), num_splits=1,
+                  s_aux=sink.cuda() if sink is not None else None)
+    def operand(tensor):
+        if not strided:
+            return tensor
+        storage = torch.empty((*tensor.shape[:-1], tensor.shape[-1] + 1),
+                              dtype=tensor.dtype, device=tensor.device)
+        result = storage[..., 1:]
+        result.copy_(tensor)
+        return result
+    q = operand(q)
+    supplied_out = operand(torch.empty_like(q).fill_(17)) if strided else None
+    if supplied_out is not None:
+        from flash_attn_interface import flash_attn_3_cuda
+        out_view = supplied_out.view(len(qs), qs[0], 64, 512) if layout == "paged" else supplied_out
+        lowlevel = dict(out=out_view, softmax_scale=512 ** -0.5, is_causal=True, num_splits=1,
+                        window_size_left=window_left, window_size_right=0, s_aux=kwargs["s_aux"],
+                        seqused_q=torch.tensor(live_q, dtype=torch.int32, device="cuda"))
+    if page_size:
+        if DISABLE_PAGEDKV:
+            pytest.skip("Paged KV disabled")
+        counts = [(n + page_size - 1) // page_size for n in ks]
+        table = torch.full((len(qs), max(counts)), -1, dtype=torch.int32)
+        physical = torch.randperm(sum(counts))
+        pk = torch.full((sum(counts), page_size, 1, 512), float("nan"), dtype=k.dtype)
+        pv = torch.full_like(pk, float("nan"))
+        offset = page_offset = 0
+        for b, (length, count) in enumerate(zip(ks, counts)):
+            table[b, :count] = physical[page_offset:page_offset + count]
+            for start in range(0, length, page_size):
+                valid = min(page_size, length - start)
+                page = int(table[b, start // page_size])
+                pk[page, :valid] = k[offset + start:offset + start + valid]
+                pv[page, :valid] = v[offset + start:offset + start + valid]
+            offset += length
+            page_offset += count
+        pk, pv, table = operand(pk.cuda()), operand(pv.cuda()), table.cuda()
+        lengths = torch.tensor(live_k, dtype=torch.int32, device="cuda")
+        query = q.view(len(qs), qs[0], 64, 512) if layout == "paged" else q
+        varlen = {} if layout == "paged" else dict(cu_seqlens_q=cu_q, max_seqlen_q=max(qs))
+        def run():
+            if supplied_out is not None:
+                return flash_attn_3_cuda.fwd(query, pk, pv, page_table=table, seqused_k=lengths,
+                                           **varlen, **lowlevel)
+            return flash_attn_with_kvcache(query, pk, pv, page_table=table, cache_seqlens=lengths,
+                                          return_softmax_lse=True, **varlen, **kwargs)
+    else:
+        dk, dv = operand(k.cuda()), operand(v.cuda())
+        def run():
+            if supplied_out is not None:
+                return flash_attn_3_cuda.fwd(q, dk, dv, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+                                           max_seqlen_q=max(qs), max_seqlen_k=max(ks),
+                                           seqused_k=torch.tensor(live_k, dtype=torch.int32, device="cuda"), **lowlevel)
+            return flash_attn_varlen_func(q, dk, dv, cu_q, cu_k, max(qs), max(ks),
+                                         return_attn_probs=True, **kwargs)
+
+    def check(result):
+        out, lse = result[:2]
+        expected_o, expected_lse, live_rows = [], [], []
+        qo = ko = 0
+        for q_capacity, k_capacity, nq, nk in zip(qs, ks, live_q, live_k):
+            scores = torch.einsum("qhd,kd->hqk", q[qo:qo+nq].float().cpu(),
+                                  k[ko:ko+nk, 0].float()) / math.sqrt(512)
+            ends = torch.arange(nq)[:, None] + nk - nq
+            keys = torch.arange(nk)[None, :]
+            valid = (keys <= ends) & (keys >= ends - window_left)
+            scores.masked_fill_(~valid[None], -torch.inf)
+            denominator = scores.logsumexp(-1)
+            if sink is not None:
+                denominator = torch.logaddexp(denominator, sink[:, None])
+            weights = (scores - denominator[..., None]).exp().masked_fill(~valid[None], 0)
+            full_o = torch.full((q_capacity, 64, 512), 17.0)
+            full_o[:nq] = torch.einsum("hqk,kd->qhd", weights, v[ko:ko+nk, 0].float())
+            expected_o.append(full_o)
+            denominator[:, ~valid.any(-1)] = -torch.inf
+            full_lse = torch.zeros(q_capacity, 64)
+            full_lse[:nq] = denominator.T
+            expected_lse.append(full_lse)
+            live_rows.append(torch.arange(q_capacity) < nq)
+            qo += q_capacity
+            ko += k_capacity
+        ref = torch.cat(expected_o)
+        actual = out.reshape_as(q).float().cpu()
+        if supplied_out is not None:
+            assert out.data_ptr() == supplied_out.data_ptr()
+        assert torch.isfinite(actual).all()
+        live = torch.cat(live_rows)
+        assert (actual[live] - ref[live]).norm() / ref[live].norm().clamp_min(1e-12) < 0.01
+        torch.testing.assert_close(actual[~live], ref[~live], rtol=0, atol=0)
+        actual_lse = lse.transpose(-1, -2).reshape(sum(qs), 64).cpu()
+        torch.testing.assert_close(actual_lse[live], torch.cat(expected_lse)[live], atol=3e-4, rtol=1e-5)
+
+    check(run())
+    if layout == "paged_varlen" and page_size == 64 and window_left == 511 and has_sink:
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                run()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            result = run()
+        q.normal_(0, 0.3)
+        graph.replay()
+        torch.cuda.synchronize()
+        check(result)

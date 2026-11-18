@@ -17,6 +17,7 @@
 #ifdef USE_PPU
 #include "qsa/dispatch.h"
 #endif
+#include "flash_fwd_d512_swa.h"
 #include "static_switch.h"
 #include "tile_size.h"
 #include "heuristics.h"
@@ -1207,7 +1208,30 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         TORCH_CHECK(batch_size == batch_size_k, "batch_size must be equal to batch_size_k");
     }
     int const max_headdim = get_max_headdim();
-    TORCH_CHECK(head_size <= max_headdim, "FlashAttention forward only supports head dimension at most " + std::to_string(max_headdim));
+#ifdef FLASHATTENTION_PPU_D512_SWA
+    bool const d512_swa = head_size == 512;
+    if (d512_swa) {
+        TORCH_CHECK(is_sm89 && q_type == at::ScalarType::BFloat16 && head_size_v == 512
+                    && num_heads == 64 && num_heads_k == 1 && !is_qsa,
+                    "D512 SWA requires PPU890, BF16, D512/V512, and 64 Q heads per KV head");
+        TORCH_CHECK((window_size_left == 511 || window_size_left == 512) && (is_causal || window_size_right == 0)
+                    && attention_chunk == 0 && softcap == 0.0 && num_splits <= 1,
+                    "D512 SWA requires a left window of 511 or 512, right window of 0, and a single KV split");
+        TORCH_CHECK(!k_new_.has_value() && !v_new_.has_value() && !q_v_.has_value()
+                    && !rotary_cos_.has_value() && !rotary_sin_.has_value()
+                    && !leftpad_k_.has_value() && !kv_batch_idx_.has_value(),
+                    "D512 SWA requires prefilled K/V without rotary or cache remapping");
+        if (paged_KV) {
+            TORCH_CHECK((page_size == 64 || page_size == 128) && seqused_k_.has_value(),
+                        "D512 paged SWA requires page size 64 or 128 and cache lengths");
+        } else {
+            TORCH_CHECK(is_varlen_q && is_varlen_k, "D512 packed SWA requires cu_seqlens_q and cu_seqlens_k");
+        }
+    }
+#else
+    constexpr bool d512_swa = false;
+#endif
+    TORCH_CHECK(d512_swa || head_size <= max_headdim, "FlashAttention forward only supports head dimension at most " + std::to_string(max_headdim));
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
     if (is_qsa) {
         // One m_block per query token means all qhead_per_khead rows must fit in kBlockM, whose
@@ -1227,8 +1251,8 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
 
     // This needs to go before kBlockM & kBlockN since we rely on the correct window_size and is_causal to set kBlockM
     // TODO: check this
-    if (window_size_left >= seqlen_k - 1) { window_size_left = -1; }
-    if (window_size_right >= seqlen_q - 1) { window_size_right = -1; }
+    if (!d512_swa && window_size_left >= seqlen_k - 1) { window_size_left = -1; }
+    if (!d512_swa && window_size_right >= seqlen_q - 1) { window_size_right = -1; }
     // QSA must retain causal so seqused_k still bounds the topk columns.
     if (!is_qsa && seqlen_q == 1 && window_size_left == -1 && window_size_right == -1 && attention_chunk == 0) {
         // Special case of hdim 128 where we want causal to have kBlockN=128, better for pagedKV and TMA
@@ -1315,7 +1339,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     }
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
-    int const head_size_rounded = round_up_headdim(head_size);
+    int const head_size_rounded = d512_swa ? 512 : round_up_headdim(head_size);
     int const head_size_v_rounded = head_size_v == head_size ? head_size_rounded : round_up_headdimv(head_size_v);
     int const seqlen_q_rounded = round_multiple(seqlen_q, 128);
     int const seqlen_k_rounded = round_multiple(seqlen_k, 128);
@@ -1324,6 +1348,29 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     // Cast to char to avoid compiler warning about narrowing
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
 
+    at::Tensor d512_out_view;
+#ifdef FLASHATTENTION_PPU_D512_SWA
+    if (d512_swa) {
+        // AIU operands need 16-byte aligned row origins. Normalize only layouts
+        // outside that contract, keeping their storage alive until launch ends.
+        auto aligned_operand = [](at::Tensor const& tensor) {
+            bool aligned = tensor.stride(-1) == 1
+                && (reinterpret_cast<uintptr_t>(tensor.data_ptr()) & 15u) == 0;
+            for (int axis = 0; axis + 1 < tensor.dim(); ++axis) {
+                aligned = aligned && tensor.stride(axis) % 8 == 0;
+            }
+            return aligned ? tensor : tensor.clone(at::MemoryFormat::Contiguous);
+        };
+        q = aligned_operand(q);
+        k = aligned_operand(k);
+        v = aligned_operand(v);
+        if (!out.is_contiguous() || (reinterpret_cast<uintptr_t>(out.data_ptr()) & 15u) != 0) {
+            d512_out_view = out;
+            // Preserve rows outside seqused_q when the caller supplies output.
+            out = out.clone(at::MemoryFormat::Contiguous);
+        }
+    }
+#endif
     at::Tensor softmax_lse;
 #ifndef FA3_HLLM_BUILD
     if (!is_varlen_q) {
@@ -1467,7 +1514,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
 
 #ifdef USE_PPU
     // Keep QSA's host-selected split count instead of recomputing it with the dense heuristic.
-    bool const use_dynamic_split = is_varlen && params.b <= 992 && params.b > 1 && num_splits <= 0
+    bool const use_dynamic_split = !d512_swa && is_varlen && params.b <= 992 && params.b > 1 && num_splits <= 0
         && !params.is_qsa;
     int const ttl_m = params.seqlen_q * params.h / params.h_k;
     int const m64_cnt = std::max(1, ttl_m / 64);
@@ -1492,13 +1539,13 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     params.num_splits_dynamic_ptr = !use_dynamic_split ? nullptr : reinterpret_cast<int*>(1);
 
     params.pagedkv_tma = get_pagedkv_tma(params);
-    params.num_splits = num_splits <= 0 ? get_num_splits(params) : num_splits;
+    params.num_splits = d512_swa ? 1 : (num_splits <= 0 ? get_num_splits(params) : num_splits);
 
 #ifdef USE_PPU
     params.use_kblockn_16 = (params.num_splits > 1 && params.use_kblockn_16) || (kblockn == 16);   // kBlockN16 only applies to Split scenario
 #endif
     // Always enable PackGQA for Split, and get_pack_gqa requires params.num_splits to decide
-    params.pack_gqa = pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params);
+    params.pack_gqa = d512_swa || (pack_gqa_.has_value() ? pack_gqa_.value() : get_pack_gqa(params));
 #ifdef USE_PPU
     // QSA packs one query's GQA heads into each tile, including MHA (group 1).
     if (params.is_qsa && params.is_e4m3) { params.pack_gqa = true; }
@@ -1801,8 +1848,8 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
 
     if(s_aux_.has_value()) {
         auto s_aux = s_aux_.value();
-        TORCH_CHECK(s_aux.scalar_type() == at::ScalarType::BFloat16,
-            "We only support bf16 dtype for S extra.");
+        TORCH_CHECK(s_aux.scalar_type() == (d512_swa ? at::ScalarType::Float : at::ScalarType::BFloat16),
+                    "D512 SWA requires FP32 sink. Other head dimensions require BF16 sink.");
         CHECK_DEVICE(s_aux);
         CHECK_SHAPE(s_aux, num_heads);
         CHECK_CONTIGUOUS(s_aux);
@@ -1859,11 +1906,24 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
 #endif
     if (total_q > 0 && (total_k + params.total_knew) > 0 && num_heads_k > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
-#if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA) && defined(FLASHATTENTION_DISABLE_SM90) && !defined(FLASHATTENTION_DISABLE_SPLIT) && !defined(FA3_HLLM_BUILD)
-        bool const launched_tail = num_splits <= 0 && run_qsa_sm80_split_tail(params, softmax_lse, stream);
-        if (!launched_tail)
+#ifdef FLASHATTENTION_PPU_D512_SWA
+        if (d512_swa) {
+            at::Tensor kv_workspace;
+            if (params.page_table) {
+                auto const tokens = d512_swa_workspace_tokens(params.total_q, params.b);
+                kv_workspace = at::empty({2, tokens, 512}, q.options());
+            }
+            run_flash_fwd_d512_swa(params, kv_workspace.defined() ? kv_workspace.data_ptr() : nullptr, stream);
+            C10_CUDA_KERNEL_LAUNCH_CHECK();
+        } else
 #endif
-        { run_mha_fwd(params, stream); }
+        {
+#if defined(USE_PPU) && defined(FLASHATTENTION_ENABLE_QSA) && defined(FLASHATTENTION_DISABLE_SM90) && !defined(FLASHATTENTION_DISABLE_SPLIT) && !defined(FA3_HLLM_BUILD)
+            bool const launched_tail = num_splits <= 0 && run_qsa_sm80_split_tail(params, softmax_lse, stream);
+            if (!launched_tail)
+#endif
+            { run_mha_fwd(params, stream); }
+        }
         if (params.num_splits > 1) {
             if (out_type == at::ScalarType::BFloat16) {
                 // Since we want output in BF16. Otherwise fwd_combine will output to FP16
@@ -1895,7 +1955,10 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     ppu::fmha::ProfilingInterface::Instance().instrument(false, fmha_prof_params);
 #endif // FA3_HLLM_BUILD
 #endif
-    // return {out, softmax_lse};
+    if (d512_out_view.defined()) {
+        d512_out_view.copy_(out);
+        out = d512_out_view;
+    }
     return {out, softmax_lse, out_accum, softmax_lse_accum};
 }
 
