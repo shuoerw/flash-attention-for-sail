@@ -323,6 +323,7 @@ struct Softmax {
         return scores_scale;
     };
 
+    template<bool StableSink=false>
     __forceinline__ __device__ TensorT finalize_aux(TensorT const& tSrSAux, float const final_scale=1.f) {
         SumOp<float> sum_op;
         quad_allreduce_(row_sum, row_sum, sum_op);
@@ -331,7 +332,19 @@ struct Softmax {
         for (int mi = 0; mi < size(row_sum); ++mi) {
             if (row_max(mi) == -INFINITY) { row_max(mi) = 0.f; }
             const float max_scaled = row_max(mi) * softmax_scale_log2 - Max_offset;
-            float sum = row_sum(mi) + exp2f(float(M_LOG2E) * tSrSAux(mi) - max_scaled);
+            float const sink_shift = float(M_LOG2E) * tSrSAux(mi) - max_scaled;
+            if constexpr (StableSink) {
+                // A large FP32 sink must become the normalization origin before
+                // exponentiation; otherwise its weight and the LSE overflow.
+                if (sink_shift > 120.f) {
+                    float const weight = exp2f(-sink_shift);
+                    float const denom = 1.f + row_sum(mi) * weight;
+                    scores_scale(mi) = weight / denom * final_scale;
+                    row_sum(mi) = tSrSAux(mi) + __logf(denom);
+                    continue;
+                }
+            }
+            float sum = row_sum(mi) + exp2f(sink_shift);
             float inv_sum = (sum == 0.f || sum != sum) ? 0.f : 1.f / sum;
             scores_scale(mi) = inv_sum * final_scale;
             // For FP8, we might have scaled the output of exp by 2**8 so we need to divide sum by that amount.
